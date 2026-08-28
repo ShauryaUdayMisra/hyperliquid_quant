@@ -142,10 +142,24 @@ class HyperliquidConfig:
 
 @dataclass(frozen=True)
 class DataConfig:
-    #: Markets we collect and (later) trade. Hyperliquid perp coin names.
+    #: Raw MARKETS value. May be a literal list, "top:N" or "all"; the
+    #: ranked forms need the exchange to resolve, which is why the spec is
+    #: kept verbatim and resolution happens in data.universe at startup.
+    markets_spec: str = _env("MARKETS", "BTC,ETH,SOL")
+
+    #: The literal coins named in the spec. For a ranked spec this is empty
+    #: until data.universe.resolve() has run.
     markets: tuple[str, ...] = tuple(
-        m.strip().upper() for m in _env("MARKETS", "BTC,ETH,SOL").split(",") if m.strip()
+        m.strip().upper()
+        for m in _env("MARKETS", "BTC,ETH,SOL").split(",")
+        if m.strip() and ":" not in m and m.strip().lower() != "all"
     )
+
+    #: Bars of history the live loop reads per market. Enough to cover
+    #: features.pipeline.MAX_LOOKBACK_BARS with room to spare. Uncapped, a
+    #: large universe would load every stored bar for every coin on every
+    #: cycle, which is where a 3-coin system stops scaling.
+    live_lookback_bars: int = _env_int("LIVE_LOOKBACK_BARS", 1_000)
 
     #: Candle intervals to backfill and keep in sync.
     candle_intervals: tuple[str, ...] = tuple(

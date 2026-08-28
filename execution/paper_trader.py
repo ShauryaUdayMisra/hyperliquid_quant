@@ -90,9 +90,23 @@ class PaperTrader:
         self.settings = settings or SETTINGS
         self.interval = interval
         self.interval_ms = INTERVAL_MS[interval]
-        self.coins = list(self.settings.data.markets)
-
         self.client = client or HyperliquidInfoClient(self.settings.hyperliquid)
+
+        # "top:N" and "all" need the exchange to resolve. Done here rather
+        # than in settings so importing config never touches the network.
+        from data.universe import parse_spec, resolve as resolve_markets
+
+        spec = self.settings.data.markets_spec
+        if parse_spec(spec)[0] == "list":
+            self.coins = list(self.settings.data.markets)
+        else:
+            self.coins = list(resolve_markets(
+                spec, self.client, fallback=self.settings.data.markets
+            ))
+        if not self.coins:
+            raise RuntimeError(
+                f"MARKETS='{spec}' resolved to no markets; nothing to trade"
+            )
         self.store = store or ParquetStore(self.settings.paths)
         self.downloader = HistoricalDownloader(
             client=self.client, store=self.store, settings=self.settings
@@ -155,10 +169,16 @@ class PaperTrader:
                 raise RuntimeError("no candle data stored; run a backfill first")
             bars = {}
             for coin in self.coins:
+                # Only the tail is needed: features look back at most
+                # MAX_LOOKBACK_BARS. Reading every stored bar for every coin
+                # is affordable for three markets and is not for a hundred.
                 frame = db.query(
-                    "SELECT ts_ms, open, high, low, close, volume, trades "
-                    "FROM candles WHERE coin = ? AND interval = ? ORDER BY ts_ms",
-                    [coin, self.interval],
+                    "SELECT * FROM ("
+                    "  SELECT ts_ms, open, high, low, close, volume, trades "
+                    "  FROM candles WHERE coin = ? AND interval = ? "
+                    "  ORDER BY ts_ms DESC LIMIT ?"
+                    ") ORDER BY ts_ms",
+                    [coin, self.interval, self.settings.data.live_lookback_bars],
                 )
                 frame["coin"] = coin
                 frame["interval"] = self.interval
@@ -168,9 +188,11 @@ class PaperTrader:
             if db.store.has_data("funding"):
                 for coin in self.coins:
                     funding[coin] = db.query(
-                        "SELECT ts_ms, coin, funding_rate, premium FROM funding "
-                        "WHERE coin = ? ORDER BY ts_ms",
-                        [coin],
+                        "SELECT * FROM ("
+                        "  SELECT ts_ms, coin, funding_rate, premium FROM funding "
+                        "  WHERE coin = ? ORDER BY ts_ms DESC LIMIT ?"
+                        ") ORDER BY ts_ms",
+                        [coin, self.settings.data.live_lookback_bars],
                     )
 
             # Order books too. If a collector has ever run, training saw

@@ -166,7 +166,9 @@ trade rather than sit flat. Railway variables now:
 | `RISK_PROFILE` | `aggressive` | 10x leverage, 100% of equity risked per trade, $100k max position, **daily-loss and drawdown halts off**. Liquidation still applies and is now the only backstop. |
 | `SIGNAL_THRESHOLD` | `0.40` | Was 0.55. Fires on ~25% of bars instead of ~7%. |
 | `MAX_HOLD_HOURS` | `24` | Nothing is held longer; re-entry allowed. |
-| `MAX_IDLE_HOURS` | `3` | Force an entry after 3h holding nothing. |
+| `MAX_IDLE_HOURS` | `0.75` | Force an entry after 45min holding nothing. Shorter than the 1h decision interval, so in practice it means "never be flat at a decision". |
+| `MARKETS` | `top:25` | The 25 most traded perps, resolved at startup. `all` (~176) is supported; see DEPLOY.md for the cost. |
+| `MAX_OPEN_POSITIONS` | `8` | Held at once. A forced entry fills every free slot, not just one. |
 
 He was shown the measured consequences and chose this anyway. **Do not
 quietly re-tighten these.** If the account collapses or liquidates, that is

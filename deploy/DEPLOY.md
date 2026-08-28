@@ -262,7 +262,9 @@ your account to $100k and throws away the track record.
 | `DASHBOARD_PASSWORD` | a long random string | **Required.** The app refuses to start on a public host without it. |
 | `DASHBOARD_USER` | `admin` | Optional, defaults to `admin`. |
 | `RISK_PROFILE` | `conservative` or `aggressive` | Which limits to enforce. |
-| `MARKETS` | `BTC,ETH,SOL` | Markets to trade. |
+| `MARKETS` | `BTC,ETH,SOL` | Markets to trade. Also accepts `top:25` (the N most traded perps) and `all` (every live perp, ~176). Ranked forms are resolved against the exchange at startup and fall back to any literal coins if it is unreachable. |
+| `MAX_OPEN_POSITIONS` | profile default | How many markets may be held at once. |
+| `LIVE_LOOKBACK_BARS` | `1000` | Bars of history the live loop reads per market. Must exceed `features.pipeline.MAX_LOOKBACK_BARS` (720). |
 | `TRADE_INTERVAL` | `1h` | Decision cadence. |
 | `BACKFILL_DAYS` | `400` | Hyperliquid serves ~5,000 candles, so 1h data caps near 208 days regardless. |
 | `SIGNAL_THRESHOLD` | `0.55` | P(up) a market must clear to open a long. |
@@ -280,6 +282,11 @@ a low P(up) means "do not buy", never "sell short".
 
 For the 6-hour emails, add `REPORT_ENABLED=true`, `REPORT_RECIPIENT`,
 `REPORT_SENDER`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_APP_PASSWORD`.
+
+`MARKETS=all` is supported but costs real time on a cold volume: roughly 23
+requests per market for a full history, so ~4,000 requests and half an hour of
+backfill before the first trade, and a much larger feature build every cycle.
+`top:25` gets most of the diversification for a twentieth of the work.
 
 Set these in Railway's UI, not in a committed file.
 

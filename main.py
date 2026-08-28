@@ -37,6 +37,9 @@ import sys
 
 from config.settings import SETTINGS
 
+#: Resolved once per process; a ranked universe must not shift mid-run.
+_MARKETS_CACHE: tuple[str, ...] | None = None
+
 
 def _setup_logging(verbose: bool) -> None:
     logging.basicConfig(
@@ -58,7 +61,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     print("Hyperliquid paper-trading research system - status\n")
     print(f"  paper trading only : {SETTINGS.paper_trading_only}")
-    print(f"  markets            : {', '.join(SETTINGS.data.markets)}")
+    print(f"  markets            : {', '.join(_configured_markets())}")
     print(f"  intervals          : {', '.join(SETTINGS.data.candle_intervals)}")
     print(f"  info endpoint      : {SETTINGS.hyperliquid.info_url}")
     print(f"  ws endpoint        : {SETTINGS.hyperliquid.ws_url}")
@@ -79,19 +82,44 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     universe = [a["name"] for a in meta.get("universe", [])]
     print(f"  API reachability   : OK ({len(universe)} perp markets listed)")
-    missing = [m for m in SETTINGS.data.markets if m not in universe]
+    missing = [m for m in _configured_markets() if m not in universe]
     if missing:
         print(f"  WARNING            : configured markets not listed: {missing}")
-    for coin in SETTINGS.data.markets:
+    for coin in _configured_markets():
         if coin in mids:
             print(f"    {coin:<5} mid = {float(mids[coin]):,.2f}")
     return 0
 
 
+def _configured_markets() -> list[str]:
+    """The markets to act on, resolving "top:N" / "all" against the exchange.
+
+    Cached for the life of the process: every subcommand that needs the list
+    would otherwise repeat the same call, and a ranked universe must not
+    shift underneath a single run.
+    """
+    global _MARKETS_CACHE
+    if _MARKETS_CACHE is not None:
+        return list(_MARKETS_CACHE)
+
+    from data.universe import parse_spec, resolve
+
+    spec = SETTINGS.data.markets_spec
+    if parse_spec(spec)[0] == "list":
+        _MARKETS_CACHE = tuple(SETTINGS.data.markets)
+        return list(_MARKETS_CACHE)
+
+    from data.hyperliquid_client import HyperliquidInfoClient
+
+    with HyperliquidInfoClient() as client:
+        _MARKETS_CACHE = resolve(spec, client, fallback=SETTINGS.data.markets)
+    return list(_MARKETS_CACHE)
+
+
 def cmd_backfill(args: argparse.Namespace) -> int:
     from data.downloader import HistoricalDownloader
 
-    coins = args.coins or list(SETTINGS.data.markets)
+    coins = args.coins or _configured_markets()
     intervals = args.intervals or list(SETTINGS.data.candle_intervals)
     downloader = HistoricalDownloader()
     print(f"Backfilling {coins} {intervals} ({args.days or SETTINGS.data.backfill_days} days)\n")
@@ -113,7 +141,7 @@ def cmd_collect(args: argparse.Namespace) -> int:
     duration = args.minutes * 60 if args.minutes else None
     collector = LiveCollector()
     print(
-        f"Collecting live data for {SETTINGS.data.markets} "
+        f"Collecting live data for {_configured_markets()} "
         f"({'until interrupted' if duration is None else f'{args.minutes} minute(s)'})\n"
     )
     stats = asyncio.run(collector.run(duration_s=duration))
@@ -126,7 +154,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
     from data.quality import check_candles, check_funding
 
     tolerance_ms = int(SETTINGS.data.future_timestamp_tolerance_s * 1000)
-    coins = args.coins or list(SETTINGS.data.markets)
+    coins = args.coins or _configured_markets()
     intervals = args.intervals or list(SETTINGS.data.candle_intervals)
 
     failures = 0
@@ -196,7 +224,7 @@ def cmd_summary(args: argparse.Namespace) -> int:
 def _load_market_data(args):
     from data.loader import load_bars, load_funding, load_order_books
 
-    coins = args.coins or list(SETTINGS.data.markets)
+    coins = args.coins or _configured_markets()
     interval = getattr(args, "interval", "1h")
     bars = load_bars(coins, interval)
     return bars, load_funding(list(bars)), load_order_books(list(bars)), interval

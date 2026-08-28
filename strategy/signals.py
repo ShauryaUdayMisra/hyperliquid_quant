@@ -99,7 +99,7 @@ class ModelStrategy(BaseStrategy):
         #: real one; counting bars in memory silently reset the clock on
         #: every redeploy, and the timer could never reach its limit.
         self.idle_since_ms: int | None = idle_since_ms
-        self._forced_coin: str | None = None
+        self._forced_coins: set[str] = set()
         self._forced_for_ms = 0
         self.decisions: list[DecisionRecord] = []
         self._signal_cache: dict[str, list[Signal | None]] = {}
@@ -208,21 +208,24 @@ class ModelStrategy(BaseStrategy):
 
         # Idle is measured on the account, not on the signals: holding a
         # position is not sitting still even when every probability is weak.
-        flat = not any(c.currently_held for c in candidates)
+        held = sum(1 for c in candidates if c.currently_held)
+        flat = held == 0
         if not flat:
             self.idle_since_ms = None
         elif self.idle_since_ms is None:
             self.idle_since_ms = view.ts_ms
 
-        self._forced_coin = None
-        forced = self._forced_entry(candidates, view.ts_ms) if flat else None
-        if forced is not None:
+        self._forced_coins = set()
+        forced = self._forced_entries(candidates, view.ts_ms, held=held) if flat else []
+        if forced:
             self.idle_since_ms = view.ts_ms
 
         selected, skipped = rank_candidates(candidates, self.risk.limits.max_open_positions)
-        if forced is not None and forced not in selected:
-            selected = list(selected) + [forced]
-            skipped = [c for c in skipped if c is not forced]
+        for candidate in forced:
+            if candidate not in selected:
+                selected = list(selected) + [candidate]
+        forced_ids = {id(c) for c in forced}
+        skipped = [c for c in skipped if id(c) not in forced_ids]
 
         # Markets the model is neutral on are not traded, but they are still
         # reported. The brief requires a line per market every window, and
@@ -309,7 +312,7 @@ class ModelStrategy(BaseStrategy):
         elif abs(current_size) > 1e-12:
             desired = np.sign(current_size)
             action = "hold"
-        elif coin == self._forced_coin:
+        elif coin in self._forced_coins:
             desired = 1.0
             action = (f"forced long: {self._idle_limit_description()} flat, "
                       f"strongest candidate at P(up) {signal.probability:.3f} "
@@ -387,26 +390,44 @@ class ModelStrategy(BaseStrategy):
     def _idle_limit_description(self) -> str:
         return f"{self._forced_for_ms / 3_600_000:.1f}h"
 
-    def _forced_entry(self, candidates: list[Candidate], ts_ms: int) -> Candidate | None:
-        """The candidate to open purely because nothing else has been opened.
+    def _forced_entries(
+        self, candidates: list[Candidate], ts_ms: int, *, held: int
+    ) -> list[Candidate]:
+        """Candidates to open purely because nothing else has been opened.
+
+        Every free position slot is filled, not just one. Opening a single
+        name and then waiting concentrates the whole account in whichever
+        coin happened to rank first, which is the opposite of what a
+        multi-market system is for -- and with no down-model it cannot even
+        hedge that concentration.
 
         Only long: without a down-model a low P(up) means "do not buy", so
         forcing a short here would be inventing a signal that does not exist.
         """
         idle = self.idle_ms(ts_ms)
         if self.max_idle_ms is None or idle < self.max_idle_ms:
-            return None
+            return []
+        slots = max(0, self.risk.limits.max_open_positions - held)
+        if slots == 0:
+            return []
         self._forced_for_ms = idle
-        scored = [c for c in candidates if np.isfinite(c.signal.probability)]
+
+        scored = [
+            c for c in candidates
+            if not c.currently_held and np.isfinite(c.signal.probability)
+        ]
         if not scored:
-            return None
-        best = max(scored, key=lambda c: c.signal.probability)
-        self._forced_coin = best.signal.coin
+            return []
+        scored.sort(key=lambda c: c.signal.probability, reverse=True)
+        chosen = scored[:slots]
+        self._forced_coins = {c.signal.coin for c in chosen}
         log.info(
-            "forcing an entry after %.1fh flat: %s at P(up) %.3f",
-            idle / 3_600_000, best.signal.coin, best.signal.probability,
+            "forcing %d entry/entries after %.1fh flat: %s",
+            len(chosen), idle / 3_600_000,
+            ", ".join(f"{c.signal.coin} P(up) {c.signal.probability:.3f}"
+                      for c in chosen),
         )
-        return best
+        return chosen
 
     # -- reporting ---------------------------------------------------------
 

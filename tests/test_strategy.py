@@ -556,3 +556,44 @@ def test_the_idle_clock_survives_a_restart() -> None:
     naive = ModelStrategy(generator, Mock(), {}, precompute=False,
                           max_idle_ms=6 * 3_600_000)
     assert naive.idle_ms(started + 5 * 3_600_000) == 0
+
+
+def test_a_forced_entry_fills_every_free_slot(system) -> None:
+    """Opening one name and waiting is concentration, not diversification.
+
+    With three markets and three slots, a forced entry from flat should put
+    the account into all three, not just the highest-ranked one.
+    """
+    _, strategy = run_with_activity_rules(
+        system, max_idle_ms=4 * 3_600_000, long_threshold=0.999
+    )
+    forced = [d for d in strategy.decisions if d.action.startswith("forced long")]
+    assert forced, "the idle timer never fired"
+
+    by_bar: dict[int, set[str]] = {}
+    for record in forced:
+        by_bar.setdefault(record.ts_ms, set()).add(record.coin)
+    widest = max(len(coins) for coins in by_bar.values())
+    assert widest > 1, "every forced entry opened a single market"
+    assert widest <= 3
+
+
+def test_a_forced_entry_does_not_exceed_the_position_limit(system) -> None:
+    universe, matrices, generator = system
+    generator.long_threshold = 0.999
+    limits = resolve_risk_profile("conservative")
+    risk = RiskEngine(limits, ExecutionConfig())
+    strategy = ModelStrategy(
+        generator, risk, matrices,
+        max_idle_ms=3_600_000, idle_since_ms=1_000_000, precompute=True,
+    )
+    candidates = [
+        Candidate(signal(coin, 0.30 + i / 100), False, 0.01)
+        for i, coin in enumerate(["BTC", "ETH", "SOL", "DOGE", "HYPE"])
+    ]
+    chosen = strategy._forced_entries(candidates, ts_ms=10_000_000, held=0)
+    assert len(chosen) == limits.max_open_positions
+
+    # Slots already occupied are not double-filled.
+    fewer = strategy._forced_entries(candidates, ts_ms=10_000_000, held=2)
+    assert len(fewer) == limits.max_open_positions - 2
