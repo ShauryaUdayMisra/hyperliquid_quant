@@ -165,7 +165,23 @@ class PaperTrader:
                         "WHERE coin = ? ORDER BY ts_ms",
                         [coin],
                     )
+
+            # Order books too. If a collector has ever run, training saw
+            # ob_* features and inference must see the same columns --
+            # otherwise the model's feature list cannot be satisfied and the
+            # strategy silently declines to signal on anything.
+            books = {}
+            if db.store.has_data("orderbook"):
+                for coin in self.coins:
+                    frame = db.query(
+                        "SELECT ts_ms, recv_ts_ms, coin, side, level, px, sz, n_orders "
+                        "FROM orderbook WHERE coin = ? ORDER BY ts_ms",
+                        [coin],
+                    )
+                    if not frame.empty:
+                        books[coin] = frame
         self._funding_frames = funding
+        self._book_frames = books
         return bars
 
     def _live_snapshots(self, bars: dict[str, pd.DataFrame]) -> dict[str, MarketSnapshot]:
@@ -235,7 +251,9 @@ class PaperTrader:
                 raise RuntimeError("a market has no stored bars yet")
 
             matrices = build_universe(
-                bars, funding_by_coin=getattr(self, "_funding_frames", {}),
+                bars,
+                funding_by_coin=getattr(self, "_funding_frames", {}),
+                book_by_coin=getattr(self, "_book_frames", {}),
                 config=self.feature_config,
             )
             self.strategy.features = matrices

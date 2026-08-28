@@ -294,3 +294,37 @@ def test_the_benchmark_market_can_produce_signals(system) -> None:
 
     btc_signals = [s for s in strategy._signal_cache.get("BTC", []) if s is not None]
     assert btc_signals, "BTC produced no signals at all"
+
+
+def test_schema_drift_degrades_gracefully_instead_of_disabling_trading(system, caplog) -> None:
+    """Regression: a column the model expected but the live matrix lacked
+    made the strategy silently decline to signal on every market, so the
+    deployed system did nothing at all and looked merely 'flat'."""
+    import logging
+
+    universe, matrices, generator = system
+    risk = RiskEngine(resolve_risk_profile("conservative"), ExecutionConfig())
+
+    # Drop three columns the model needs, as if inference loaded different
+    # inputs from training.
+    dropped = generator.model.features[:3]
+    trimmed = {c: m.drop(columns=dropped) for c, m in matrices.items()}
+
+    strategy = ModelStrategy(generator, risk, trimmed, precompute=False)
+    with caplog.at_level(logging.WARNING):
+        signal = strategy._signal_for("ETH", len(trimmed["ETH"]) - 1)
+
+    assert signal is not None, "drift must not silently disable signalling"
+    assert 0.0 <= signal.probability <= 1.0
+    assert any("absent from the live matrix" in r.message for r in caplog.records)
+
+
+def test_the_drift_warning_fires_once_per_market(system) -> None:
+    universe, matrices, generator = system
+    risk = RiskEngine(resolve_risk_profile("conservative"), ExecutionConfig())
+    trimmed = {c: m.drop(columns=generator.model.features[:2]) for c, m in matrices.items()}
+    strategy = ModelStrategy(generator, risk, trimmed, precompute=False)
+
+    for _ in range(3):
+        strategy._signal_for("ETH", len(trimmed["ETH"]) - 1)
+    assert strategy._warned_missing == {"ETH"}

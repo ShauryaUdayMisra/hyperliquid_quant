@@ -83,6 +83,7 @@ class ModelStrategy(BaseStrategy):
         self.atr_column = atr_column
         self.decisions: list[DecisionRecord] = []
         self._signal_cache: dict[str, list[Signal | None]] = {}
+        self._warned_missing: set[str] = set()
         if precompute:
             self._precompute_signals()
 
@@ -139,9 +140,23 @@ class ModelStrategy(BaseStrategy):
         if frame is None or index >= len(frame):
             return None
         row = frame.iloc[[index]]
+
+        # A column the model expects but the live matrix lacks is schema
+        # drift between training and inference. Refusing to signal made the
+        # system silently do nothing at all, which is far worse than scoring
+        # with the column absent -- trees handle a missing value natively.
+        # Warned once per coin so the drift is visible rather than buried.
         missing = [c for c in self.generator.model.features if c not in row.columns]
         if missing:
-            return None
+            if coin not in self._warned_missing:
+                self._warned_missing.add(coin)
+                log.warning(
+                    "%s: %d model feature(s) absent from the live matrix, scoring "
+                    "with them as NaN (e.g. %s). Training and inference are "
+                    "reading different inputs -- investigate.",
+                    coin, len(missing), missing[:5],
+                )
+            row = row.reindex(columns=list(row.columns) + missing)
         # A row that is still warming up cannot produce a trustworthy
         # probability, so no signal is generated at all.
         populated = row[self.generator.model.features].notna().mean(axis=1).iloc[0]
