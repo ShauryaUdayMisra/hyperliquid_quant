@@ -261,6 +261,8 @@ your account to $100k and throws away the track record.
 | --- | --- | --- |
 | `DASHBOARD_PASSWORD` | a long random string | **Required.** The app refuses to start on a public host without it. |
 | `DASHBOARD_USER` | `admin` | Optional, defaults to `admin`. |
+| `DISPLAY_TIMEZONE` | `Asia/Kolkata` | Timezone every time on the dashboard is shown in, and whose midnight starts "today" for the daily P&L. Presentation only — the trader is UTC throughout. An unknown name falls back to UTC with a warning. |
+| `MIN_HOLD_HOURS` | `4` | A fading probability may not close a position younger than this. Risk exits ignore it. |
 | `RISK_PROFILE` | `conservative` or `aggressive` | Which limits to enforce. |
 | `MARKETS` | `BTC,ETH,SOL` | Markets to trade. Also accepts `top:25` (the N most traded perps) and `all` (every live perp, ~176). Ranked forms are resolved against the exchange at startup and fall back to any literal coins if it is unreachable. |
 | `MAX_OPEN_POSITIONS` | profile default | How many markets may be held at once. |

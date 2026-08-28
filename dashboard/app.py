@@ -17,6 +17,8 @@ import logging
 import os
 import secrets
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import numpy as np
@@ -74,8 +76,34 @@ def require_auth(credentials: HTTPBasicCredentials | None = Depends(_security)) 
         )
 
 
+#: Timezone every time on the page is shown in, and the one whose midnight
+#: starts "today" for the daily P&L. The trader itself is UTC throughout --
+#: this is presentation only, applied at both ends so the label and the
+#: number cannot disagree.
+DISPLAY_TZ = os.environ.get("DISPLAY_TIMEZONE", "Asia/Kolkata").strip() or "UTC"
+
+try:
+    _DISPLAY_ZONE = ZoneInfo(DISPLAY_TZ)
+except Exception:  # noqa: BLE001 - a bad tz name must not stop the dashboard
+    log.warning("unknown DISPLAY_TIMEZONE %r; falling back to UTC", DISPLAY_TZ)
+    DISPLAY_TZ = "UTC"
+    _DISPLAY_ZONE = ZoneInfo("UTC")
+
+
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _local_midnight_ms(now_ms: int) -> int:
+    """Start of the current day in the display timezone.
+
+    Using UTC midnight while showing IST clocks would put the daily P&L
+    boundary at 5:30am for the reader, which is a quietly wrong number
+    rather than a visibly wrong one.
+    """
+    local = datetime.fromtimestamp(now_ms / 1000, tz=_DISPLAY_ZONE)
+    midnight = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    return int(midnight.timestamp() * 1000)
 
 
 def _interval_ms() -> int:
@@ -98,6 +126,30 @@ DAY_MS = 86_400_000
 
 def _store() -> ParquetStore:
     return ParquetStore(SETTINGS.paths)
+
+
+def _configured_markets() -> list[str]:
+    """The markets the trader is actually running, as it recorded them.
+
+    Re-resolving "top:25" here would ask the exchange a second time and
+    could disagree with the trader if volumes shifted, so the decisions
+    table -- written by the trader itself -- is the source of truth, with
+    the literal setting as a fallback before the first cycle lands.
+    """
+    try:
+        frame = _query("SELECT DISTINCT coin FROM decisions")
+        coins = sorted(str(c) for c in frame["coin"]) if not frame.empty else []
+    except Exception:  # noqa: BLE001 - the dashboard must render regardless
+        coins = []
+    return coins or list(SETTINGS.data.markets)
+
+
+def _signal_threshold() -> float:
+    """What start.sh passes to the trader; the dashboard cannot see argv."""
+    try:
+        return float(os.environ.get("SIGNAL_THRESHOLD", "0.55"))
+    except ValueError:
+        return 0.55
 
 
 def _load_account() -> PaperExchange:
@@ -168,9 +220,10 @@ def api_pnl() -> JSONResponse:
         "lifetime": equity - exchange.starting_capital,
         "lifetime_pct": (equity / exchange.starting_capital - 1.0)
         if exchange.starting_capital else 0.0,
-        "day": _pnl_since(curve, (now_ms // DAY_MS) * DAY_MS, equity),
+        "day": _pnl_since(curve, _local_midnight_ms(now_ms), equity),
         "hour": _pnl_since(curve, now_ms - HOUR_MS, equity),
         "readings": int(len(curve)),
+        "timezone": DISPLAY_TZ,
     })
 
 
@@ -202,7 +255,13 @@ def api_state() -> JSONResponse:
     # exactly how a 13:00 entry got described as 12:21.
     deadline = int(idle_since) + max_idle_ms if idle_since and max_idle_ms else None
     return JSONResponse({
+        "timezone": DISPLAY_TZ,
+        "markets": list(_configured_markets()),
+        "max_position_usd": SETTINGS.risk.max_position_usd,
+        "risk_per_trade": SETTINGS.risk.risk_per_trade,
+        "signal_threshold": _signal_threshold(),
         "activity": {
+            "min_hold_hours": SETTINGS.strategy.min_hold_hours,
             "max_hold_hours": SETTINGS.strategy.max_hold_hours,
             "max_idle_hours": SETTINGS.strategy.max_idle_hours,
             "idle_since_ms": idle_since,
@@ -431,7 +490,19 @@ const usd=n=>(n<0?'-$':'$')+Math.abs(Number(n)).toLocaleString(undefined,
   {minimumFractionDigits:2,maximumFractionDigits:2});
 const sgn=n=>(n>=0?'+':'')+usd(n).replace('-','');
 const cls=n=>n>0?'up':(n<0?'down':'');
-const tm=ms=>new Date(ms).toISOString().slice(5,16).replace('T',' ');
+// Every time on this page is shown in TZ (the server's DISPLAY_TIMEZONE).
+// The trader is UTC throughout; this is presentation only.
+let TZ='UTC';
+const fmt=(ms,opts)=>new Date(ms).toLocaleString('en-GB',
+  Object.assign({timeZone:TZ,hour12:false},opts));
+const tm=ms=>fmt(ms,{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'});
+const hm=ms=>fmt(ms,{hour:'2-digit',minute:'2-digit'});
+const tzLabel=()=>{
+  const parts=new Intl.DateTimeFormat('en-GB',
+    {timeZone:TZ,timeZoneName:'short'}).formatToParts(new Date());
+  const z=parts.find(p=>p.type==='timeZoneName');
+  return z?z.value:TZ;
+};
 
 function pnlCard(label,value,sub){
   if(value===null||value===undefined)
@@ -450,6 +521,8 @@ async function load(){
     fetch('/api/activity').then(r=>r.json()),
     fetch('/api/reasoning').then(r=>r.json())]);
 
+  TZ = s.timezone || 'UTC';
+
   document.getElementById('sub').textContent =
     `${s.profile} profile · max ${s.max_leverage}x · ${s.max_positions} positions · `
     +`${s.closed_trades} round trips · ${s.fills} fills · ${s.liquidations} liquidation(s)`;
@@ -458,16 +531,23 @@ async function load(){
   // broken or simply waiting. Say which, and say when it acts next.
   const act = s.activity || {};
   const rules = [];
-  if (act.next_decision_ms) {
-    rules.push(`next decision ${new Date(act.next_decision_ms).toISOString().slice(11,16)} UTC`);
+  if (s.markets && s.markets.length) {
+    rules.push(`${s.markets.length} markets`);
   }
-  if (act.max_hold_hours) rules.push(`closes any position after ${act.max_hold_hours}h`);
+  if (s.max_position_usd) rules.push(`max ${usd(s.max_position_usd)} per market`);
+  if (s.signal_threshold) rules.push(`enters at P(up) ≥ ${s.signal_threshold}`);
+  if (act.min_hold_hours && act.max_hold_hours) {
+    rules.push(`holds ${act.min_hold_hours}–${act.max_hold_hours}h`);
+  }
+  if (act.next_decision_ms) {
+    rules.push(`next decision ${hm(act.next_decision_ms)} ${tzLabel()}`);
+  }
   if (act.max_idle_hours) {
     if (s.positions.length) {
       rules.push(`forces an entry after ${act.max_idle_hours}h holding nothing`);
     } else if (act.idle_hours != null) {
       const when = act.forced_entry_at_ms
-        ? new Date(act.forced_entry_at_ms).toISOString().slice(11,16) + ' UTC'
+        ? hm(act.forced_entry_at_ms) + ' ' + tzLabel()
         : null;
       rules.push(`flat for ${act.idle_hours.toFixed(1)}h — forces an entry`
                  + (when ? ` at the ${when} decision` : '')
@@ -487,7 +567,7 @@ async function load(){
       <div class="value">${usd(p.equity)}</div>
       <div class="sub">from ${usd(p.starting_capital)}</div></div>`,
     pnlCard('P&L — lifetime', p.lifetime, (p.lifetime_pct*100).toFixed(2)+'%'),
-    pnlCard('P&L — today', p.day, 'since 00:00 UTC'),
+    pnlCard('P&L — today', p.day, 'since 00:00 '+tzLabel()),
     pnlCard('P&L — last hour', p.hour, 'rolling 60 min'),
     `<div class="card"><div class="label">Costs paid</div>
       <div class="value" style="font-size:18px">${usd(s.fees+s.slippage+s.funding)}</div>
@@ -548,7 +628,7 @@ async function load(){
     : '<p class="muted">No decisions recorded yet. The trader writes one per bar close.</p>';
 
   document.getElementById('updated').textContent =
-    'Updated '+new Date().toLocaleTimeString()+' · refreshes every 30s';
+    'Updated '+hm(Date.now())+' '+tzLabel()+' · refreshes every 30s';
 }
 load(); setInterval(load, 30000);
 </script></body></html>"""

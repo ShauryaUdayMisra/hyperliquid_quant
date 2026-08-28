@@ -239,6 +239,15 @@ label (longer horizon, or funding-carry rather than direction) and more
 regularisation, judged on walk-forward validation only — **not** further
 tuning against the holdout, which has already been read once.
 
+## The dashboard
+
+Read-only. Times are rendered in `DISPLAY_TIMEZONE` (default `Asia/Kolkata`)
+and so is the daily P&L boundary — both ends, so the label and the number
+cannot disagree. Everything stored and computed is UTC; this is presentation
+only. `/api/state` reports the live configuration (markets, per-position cap,
+thresholds, hold window) because configuration the reader cannot see is
+configuration they cannot trust.
+
 ## Deployment
 
 Live on Railway; runbook in `deploy/DEPLOY.md`. One service runs the trader

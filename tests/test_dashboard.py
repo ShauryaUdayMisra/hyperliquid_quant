@@ -93,3 +93,54 @@ def test_the_forced_entry_is_reported_at_the_decision_that_acts_on_it() -> None:
     # A deadline that lands exactly on a boundary is served by that boundary.
     on_the_hour = 13 * hour
     assert app_module._next_decision_ms(on_the_hour - 1) == on_the_hour + 15_000
+
+
+def test_the_daily_pnl_boundary_matches_the_timezone_it_is_labelled_with() -> None:
+    """A UTC midnight under an IST clock is a quietly wrong number.
+
+    The card says "since 00:00 IST". If the server cut the day at UTC
+    midnight the boundary would actually be 05:30 IST, and nothing on the
+    page would say so.
+    """
+    from datetime import datetime
+
+    import dashboard.app as app_module
+
+    now_ms = 1_787_900_000_000
+    midnight = app_module._local_midnight_ms(now_ms)
+    local = datetime.fromtimestamp(midnight / 1000, tz=app_module._DISPLAY_ZONE)
+
+    assert (local.hour, local.minute, local.second) == (0, 0, 0)
+    assert midnight <= now_ms
+    assert now_ms - midnight < 24 * 3_600_000
+
+
+def test_an_unusable_timezone_falls_back_instead_of_breaking_the_page(monkeypatch) -> None:
+    import importlib
+
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "s3cret")
+    monkeypatch.setenv("DISPLAY_TIMEZONE", "Mars/Olympus_Mons")
+    import dashboard.app as app_module
+
+    importlib.reload(app_module)
+    assert app_module.DISPLAY_TZ == "UTC"
+
+    monkeypatch.delenv("DISPLAY_TIMEZONE")
+    importlib.reload(app_module)
+
+
+def test_the_page_reports_the_settings_it_is_running(monkeypatch) -> None:
+    """Configuration the reader cannot see is configuration they cannot trust."""
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "s3cret")
+    import importlib
+
+    import dashboard.app as app_module
+
+    importlib.reload(app_module)
+    http = TestClient(app_module.app)
+    body = http.get("/api/state", auth=("admin", "s3cret")).json()
+
+    for key in ("timezone", "markets", "max_position_usd", "signal_threshold"):
+        assert key in body, f"/api/state does not expose {key}"
+    for key in ("min_hold_hours", "max_hold_hours", "max_idle_hours"):
+        assert key in body["activity"], f"activity does not expose {key}"
