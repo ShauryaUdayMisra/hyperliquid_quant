@@ -328,3 +328,196 @@ def test_the_drift_warning_fires_once_per_market(system) -> None:
     for _ in range(3):
         strategy._signal_for("ETH", len(trimmed["ETH"]) - 1)
     assert strategy._warned_missing == {"ETH"}
+
+
+# ==========================================================================
+# Activity rules: the holding cap and the idle timer
+# ==========================================================================
+
+def run_with_activity_rules(system, *, max_hold_ms=None, max_idle_bars=None,
+                            long_threshold=0.50, profile="conservative"):
+    universe, matrices, generator = system
+    generator.long_threshold = long_threshold
+    limits = resolve_risk_profile(profile)
+    execution = ExecutionConfig()
+    risk = RiskEngine(limits, execution)
+    strategy = ModelStrategy(
+        generator, risk, matrices,
+        max_hold_ms=max_hold_ms, max_idle_bars=max_idle_bars,
+    )
+    exchange = PaperExchange(
+        limits.starting_capital, config=execution, simulator=FillSimulator(execution)
+    )
+    engine = BacktestEngine(
+        universe,
+        BacktestConfig(interval="1h", warmup_bars=800, asset_max_leverage={"BTC": 40.0}),
+        risk=limits,
+        exchange=exchange,
+        features=matrices,
+    )
+    return engine.run(strategy), strategy
+
+
+def holding_periods_ms(result) -> list[int]:
+    return [
+        int(t.closed_ts_ms) - int(t.opened_ts_ms)
+        for t in result.trades
+        if getattr(t, "opened_ts_ms", None) and getattr(t, "closed_ts_ms", None)
+    ]
+
+
+def test_no_position_outlives_the_holding_cap(system) -> None:
+    cap = 6 * 3_600_000        # six hours, short enough to bind often
+    result, _ = run_with_activity_rules(system, max_hold_ms=cap)
+    held = holding_periods_ms(result)
+    assert held, "the run produced no closed trades to measure"
+    # The cap is evaluated on a bar, so a position can survive at most one
+    # further bar before the closing order executes at the next open.
+    assert max(held) <= cap + 2 * 3_600_000
+
+
+def test_without_a_cap_positions_may_be_held_longer(system) -> None:
+    cap = 6 * 3_600_000
+    capped, _ = run_with_activity_rules(system, max_hold_ms=cap)
+    uncapped, _ = run_with_activity_rules(system, max_hold_ms=None)
+    # Guards against the cap being trivially satisfied because nothing was
+    # ever held that long to begin with.
+    assert max(holding_periods_ms(uncapped)) > max(holding_periods_ms(capped))
+
+
+def test_the_idle_timer_forces_an_entry_the_model_did_not_ask_for(system) -> None:
+    # A threshold this high means the model never asks to enter, so every
+    # trade in the run exists only because the idle timer forced it.
+    _, strategy = run_with_activity_rules(
+        system, max_idle_bars=4, long_threshold=0.999
+    )
+    forced = [d for d in strategy.decisions if d.action.startswith("forced long")]
+    assert forced, "the idle timer never fired"
+    assert all(d.signal.probability < 0.999 for d in forced)
+
+
+def test_without_an_idle_timer_a_silent_model_trades_nothing(system) -> None:
+    result, strategy = run_with_activity_rules(
+        system, max_idle_bars=None, long_threshold=0.999
+    )
+    assert not [d for d in strategy.decisions if d.action.startswith("forced long")]
+    assert result.trades == []
+
+
+def test_the_holding_cap_outranks_a_still_confident_model(system) -> None:
+    # Threshold of 0.0 means every bar asks to be long, so any close at all
+    # must have come from the cap rather than from a fading signal.
+    _, strategy = run_with_activity_rules(
+        system, max_hold_ms=3 * 3_600_000, long_threshold=0.0
+    )
+    closes = [d for d in strategy.decisions if "holding cap" in d.action]
+    assert closes, "an always-long model was never closed by the cap"
+
+
+def test_a_restarted_process_inherits_the_true_position_age(system) -> None:
+    """The clock lives on the position, not in the strategy's memory.
+
+    A live restart builds a new ModelStrategy against a restored account.
+    If age were counted in the strategy, every restart would silently grant
+    each open position a fresh 24 hours.
+    """
+    from backtest.engine import MarketView
+
+    universe, matrices, _ = system
+    limits = resolve_risk_profile("conservative")
+    execution = ExecutionConfig()
+    exchange = PaperExchange(
+        limits.starting_capital, config=execution, simulator=FillSimulator(execution)
+    )
+    coin = next(iter(universe))
+    opened = 1_700_000_000_000
+    position = exchange.position(coin)
+    position.size, position.entry_price, position.opened_ts_ms = 1.0, 100.0, opened
+
+    engine = BacktestEngine(
+        universe,
+        BacktestConfig(interval="1h", warmup_bars=800, asset_max_leverage={"BTC": 40.0}),
+        risk=limits, exchange=exchange, features=matrices,
+    )
+    now = opened + 30 * 3_600_000
+    snapshots = {c: engine._snapshot(c, 900) for c in universe}
+    view = MarketView(900, now, universe, snapshots, exchange, limits, matrices)
+
+    assert view.position_age_ms(coin) == 30 * 3_600_000
+    other = [c for c in universe if c != coin]
+    if other:
+        assert view.position_age_ms(other[0]) is None
+
+
+def test_a_reduction_that_would_leave_dust_closes_instead(system) -> None:
+    """The stub that a partial exit leaves behind must not be untradeable.
+
+    A remainder below the minimum trade size can never be sold, so the
+    position becomes permanent -- immune to the exit signal, the holding
+    cap and everything else.
+    """
+    from backtest.engine import MarketView
+    from execution.paper_exchange import DecisionContext
+    from strategy.base import BaseStrategy
+
+    universe, matrices, _ = system
+    limits = resolve_risk_profile("conservative")
+    execution = ExecutionConfig()
+    exchange = PaperExchange(
+        limits.starting_capital, config=execution, simulator=FillSimulator(execution)
+    )
+    coin = next(iter(universe))
+    engine = BacktestEngine(
+        universe,
+        BacktestConfig(interval="1h", warmup_bars=800, asset_max_leverage={"BTC": 40.0}),
+        risk=limits, exchange=exchange, features=matrices,
+    )
+    snapshots = {c: engine._snapshot(c, 900) for c in universe}
+    view = MarketView(900, snapshots[coin].ts_ms, universe, snapshots,
+                      exchange, limits, matrices)
+    price = view.price(coin)
+
+    position = exchange.position(coin)
+    position.size = 1_000.0 / price          # a $1,000 position
+    position.entry_price = price
+    position.opened_ts_ms = view.ts_ms - 3_600_000
+
+    # Ask to keep $4 of it -- below the $10 minimum trade size.
+    orders = BaseStrategy.orders_to_reach(
+        view, coin, 4.0 / price, DecisionContext(reason="trim")
+    )
+    assert len(orders) == 1
+    assert orders[0].size == pytest.approx(position.size)   # all of it, not most
+
+
+def test_an_existing_dust_position_can_still_be_closed(system) -> None:
+    from backtest.engine import MarketView
+    from execution.paper_exchange import DecisionContext
+    from strategy.base import BaseStrategy
+
+    universe, matrices, _ = system
+    limits = resolve_risk_profile("conservative")
+    execution = ExecutionConfig()
+    exchange = PaperExchange(
+        limits.starting_capital, config=execution, simulator=FillSimulator(execution)
+    )
+    coin = next(iter(universe))
+    engine = BacktestEngine(
+        universe,
+        BacktestConfig(interval="1h", warmup_bars=800, asset_max_leverage={"BTC": 40.0}),
+        risk=limits, exchange=exchange, features=matrices,
+    )
+    snapshots = {c: engine._snapshot(c, 900) for c in universe}
+    view = MarketView(900, snapshots[coin].ts_ms, universe, snapshots,
+                      exchange, limits, matrices)
+
+    position = exchange.position(coin)
+    position.size = 3.0 / view.price(coin)   # a $3 stub, below the minimum
+    position.entry_price = view.price(coin)
+    position.opened_ts_ms = view.ts_ms - 3_600_000
+
+    orders = BaseStrategy.orders_to_reach(
+        view, coin, 0.0, DecisionContext(reason="exit")
+    )
+    assert len(orders) == 1, "a position too small to trade is a position you cannot leave"
+    assert orders[0].reduce_only

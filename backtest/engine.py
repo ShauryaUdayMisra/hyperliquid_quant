@@ -103,6 +103,18 @@ class MarketView:
     def position_size(self, coin: str) -> float:
         return self.exchange.position(coin).size
 
+    def position_age_ms(self, coin: str) -> int | None:
+        """How long the open position has been held, or None if flat.
+
+        Read from the position itself rather than counted in the strategy,
+        so a restarted live process inherits the true age from the restored
+        account instead of resetting every holding clock to zero.
+        """
+        position = self.exchange.position(coin)
+        if position.is_flat or position.opened_ts_ms is None:
+            return None
+        return max(0, self.ts_ms - int(position.opened_ts_ms))
+
     def notional_to_size(self, coin: str, notional: float) -> float:
         price = self.price(coin)
         return 0.0 if price <= 0 else notional / price

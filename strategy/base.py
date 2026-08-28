@@ -38,11 +38,30 @@ class BaseStrategy(ABC):
         Returns nothing when the adjustment is smaller than
         ``min_trade_notional``, so a strategy cannot bleed fees churning
         rounding errors.
+
+        Two exceptions keep that guard from trapping the account in
+        positions it cannot leave:
+
+        * A reduction that would leave less than ``min_trade_notional`` on
+          the book goes all the way to zero instead. Otherwise the remainder
+          is a stub too small to trade, and every later attempt to close it
+          is refused for being too small -- which is exactly how a position
+          outlived a holding cap that fired on it every bar for 562 hours.
+        * A full exit is never suppressed for size. Getting out is not
+          churn, and a position that cannot be closed is unbounded risk.
         """
         current = view.position_size(coin)
-        delta = target_size - current
         price = view.price(coin)
-        if abs(delta) < DUST or abs(delta) * price < min_trade_notional:
+
+        reducing = abs(target_size) < abs(current)
+        if reducing and 0.0 < abs(target_size) * price < min_trade_notional:
+            target_size = 0.0
+
+        delta = target_size - current
+        closing = abs(target_size) < DUST and abs(current) >= DUST
+        if abs(delta) < DUST:
+            return []
+        if not closing and abs(delta) * price < min_trade_notional:
             return []
         side = Side.BUY if delta > 0 else Side.SELL
         reduce_only = abs(target_size) < abs(current) and (

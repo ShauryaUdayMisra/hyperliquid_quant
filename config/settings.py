@@ -355,12 +355,45 @@ class ReportConfig:
 # --------------------------------------------------------------------------
 
 @dataclass(frozen=True)
+class StrategyConfig:
+    """Activity rules that sit outside the model's opinion."""
+
+    #: Hard cap on how long any position may be held, in hours. The label
+    #: the model was trained on asks about a short horizon, so a position
+    #: carried well past it is being held on an expired forecast. Closing
+    #: and re-entering is allowed, so a persistent signal survives.
+    max_hold_hours: float = _env_float("MAX_HOLD_HOURS", 24.0)
+
+    #: After this many consecutive fully-flat bars, open the strongest
+    #: candidate regardless of the entry threshold. Buys activity, not
+    #: accuracy -- these are by construction the trades the model was not
+    #: confident enough to ask for. Set to 0 to leave the system idle.
+    max_idle_bars: int = _env_int("MAX_IDLE_BARS", 6)
+
+    @property
+    def max_hold_ms(self) -> int | None:
+        return int(self.max_hold_hours * 3_600_000) if self.max_hold_hours > 0 else None
+
+    @property
+    def idle_bars(self) -> int | None:
+        return self.max_idle_bars if self.max_idle_bars > 0 else None
+
+    def describe(self) -> str:
+        hold = (f"close after {self.max_hold_hours:g}h"
+                if self.max_hold_ms else "no holding cap")
+        idle = (f"force an entry after {self.max_idle_bars} flat bar(s)"
+                if self.idle_bars else "never force an entry")
+        return f"{hold}; {idle}"
+
+
+@dataclass(frozen=True)
 class Settings:
     paths: Paths = field(default_factory=Paths)
     hyperliquid: HyperliquidConfig = field(default_factory=HyperliquidConfig)
     data: DataConfig = field(default_factory=DataConfig)
     risk: RiskLimits = field(default_factory=resolve_risk_profile)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
+    strategy: StrategyConfig = field(default_factory=StrategyConfig)
     report: ReportConfig = field(default_factory=ReportConfig)
 
     #: Global kill-switch documenting intent. Nothing in this repo may place

@@ -51,6 +51,23 @@ same close.
 `MarketView` and calls the same `ModelStrategy.on_bar`. Do not fork this
 logic — divergence would make the backtest stop being evidence about live.
 
+**Activity rules sit outside the model** (`strategy/signals.py`,
+`config.settings.StrategyConfig`). `MAX_HOLD_HOURS` force-closes any position
+past its age regardless of how good the probability still looks; re-entry on
+a later bar is allowed. `MAX_IDLE_BARS` opens the strongest candidate after
+that many consecutive flat bars even though it never cleared the entry
+threshold. Both buy activity, not accuracy — the forced trades are by
+construction the ones the model was not confident enough to ask for. Position
+age is read from `Position.opened_ts_ms`, never counted in the strategy, so a
+live restart cannot hand every open position a fresh clock.
+
+**A position you cannot close is unbounded risk.** `orders_to_reach` refuses
+trades under `min_trade_notional` to stop churn. Left alone, that guard also
+refuses to close a sub-$10 stub, so a partial exit could strand a position
+permanently — immune to the exit signal *and* the holding cap, which fired on
+one such position every bar for 562 hours. Reductions that would leave less
+than the minimum now go to zero, and full exits are never suppressed for size.
+
 **Accounting identities.** `equity == cash + unrealised` at every bar, and
 `final − start == realised + unrealised − fees − funding`. Verified by
 `python main.py prove-accounting` and in CI via `tests/test_accounting_proof.py`.
@@ -123,10 +140,19 @@ hourly data:
 | Locked holdout AUC | **0.504** (coin flip) |
 | Out-of-sample return, conservative | −1.08% |
 | Out-of-sample return, aggressive (10x) | −41.38% |
+| Out-of-sample, aggressive + forced activity | **−54.07%** (2 liquidations) |
 | Buy-and-hold, same period | +17.60% |
 
 The aggressive profile ended a full backtest at **$54.95** — from paying
 $231,646 in slippage at 1,098× annual turnover, not from bad direction calls.
+
+Lowering the entry threshold and forcing activity was measured, not guessed.
+Out-of-sample, on the conservative profile: 0.55 → −1.59% over 13 trades,
+0.45 → −3.45% over 63, 0.40 → −3.74% over 105, and 0.40 with a 24h holding cap
+and a 6-bar idle timer → −4.29% over 167. More trading, monotonically more
+loss. On the aggressive profile the same settings end the full backtest at
+**$4.43** with two liquidations. This is what a 0.504-AUC model does when you
+let it trade more: it pays spread and fees to express a coin flip.
 
 Treat this as the honest baseline. The productive next step is a better
 label (longer horizon, or funding-carry rather than direction) and more

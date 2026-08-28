@@ -119,7 +119,9 @@ class PaperTrader:
         self._started_ms = int(restored.get("started_ms", time.time() * 1000))
 
         self.strategy = ModelStrategy(
-            self.generator, self.risk, {}, precompute=False
+            self.generator, self.risk, {}, precompute=False,
+            max_hold_ms=self.settings.strategy.max_hold_ms,
+            max_idle_bars=self.settings.strategy.idle_bars,
         )
         self.feature_config = FeatureConfig(interval=interval)
         self._stop = asyncio.Event()

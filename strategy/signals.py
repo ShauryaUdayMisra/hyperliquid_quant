@@ -65,6 +65,8 @@ class ModelStrategy(BaseStrategy):
         exit_threshold: float | None = None,
         min_rebalance_fraction: float = 0.25,
         atr_column: str = "vol_atr_14",
+        max_hold_ms: int | None = None,
+        max_idle_bars: int | None = None,
         precompute: bool = True,
     ) -> None:
         self.generator = generator
@@ -81,6 +83,19 @@ class ModelStrategy(BaseStrategy):
         #: Ignore rebalances smaller than this share of the current position.
         self.min_rebalance_fraction = min_rebalance_fraction
         self.atr_column = atr_column
+        #: Hard cap on how long a position may be held. The model's label
+        #: asks about a short horizon, so a position carried for days is
+        #: being held on nothing -- the forecast it was opened on expired.
+        #: None disables the cap.
+        self.max_hold_ms = max_hold_ms
+        #: After this many consecutive fully-flat bars, take the strongest
+        #: candidate even though it did not clear the entry threshold. This
+        #: buys activity, not accuracy: the trades it forces are by
+        #: definition the ones the model was not confident enough to want.
+        self.max_idle_bars = max_idle_bars
+        self._idle_bars = 0
+        self._forced_coin: str | None = None
+        self._forced_after = 0
         self.decisions: list[DecisionRecord] = []
         self._signal_cache: dict[str, list[Signal | None]] = {}
         self._warned_missing: set[str] = set()
@@ -186,7 +201,22 @@ class ModelStrategy(BaseStrategy):
         if not candidates:
             return []
 
+        # Idle is measured on the account, not on the signals: holding a
+        # position is not sitting still even when every probability is weak.
+        flat = not any(c.currently_held for c in candidates)
+        self._idle_bars = self._idle_bars + 1 if flat else 0
+
+        self._forced_coin = None
+        forced = self._forced_entry(candidates) if flat else None
+        if forced is not None:
+            # Reset only after the reason has been captured for the log.
+            self._forced_after = self._idle_bars
+            self._idle_bars = 0
+
         selected, skipped = rank_candidates(candidates, self.risk.limits.max_open_positions)
+        if forced is not None and forced not in selected:
+            selected = list(selected) + [forced]
+            skipped = [c for c in skipped if c is not forced]
 
         # Markets the model is neutral on are not traded, but they are still
         # reported. The brief requires a line per market every window, and
@@ -249,7 +279,16 @@ class ModelStrategy(BaseStrategy):
         current_notional = abs(current_size) * price
 
         # -- decide the desired direction --
-        if current_size > 0 and signal.probability < self.exit_threshold:
+        # The holding cap outranks the model. A position past its horizon is
+        # closed even if the probability still looks good; re-entering on the
+        # next bar is allowed, so a genuinely persistent signal survives the
+        # cap at the cost of one round trip.
+        age_ms = view.position_age_ms(coin)
+        if age_ms is not None and self.max_hold_ms is not None and age_ms >= self.max_hold_ms:
+            desired = 0.0
+            action = (f"close: held {age_ms / 3_600_000:.1f}h, at or past the "
+                      f"{self.max_hold_ms / 3_600_000:.0f}h holding cap")
+        elif current_size > 0 and signal.probability < self.exit_threshold:
             desired = 0.0
             action = f"close long: P(up) {signal.probability:.3f} below exit {self.exit_threshold:.2f}"
         elif current_size < 0 and (signal.down_probability or 0.0) < self.exit_threshold:
@@ -264,6 +303,11 @@ class ModelStrategy(BaseStrategy):
         elif abs(current_size) > 1e-12:
             desired = np.sign(current_size)
             action = "hold"
+        elif coin == self._forced_coin:
+            desired = 1.0
+            action = (f"forced long: {self._idle_limit_description()} flat, "
+                      f"strongest candidate at P(up) {signal.probability:.3f} "
+                      f"(below the {self.generator.long_threshold:.2f} entry bar)")
         else:
             self.decisions.append(DecisionRecord(
                 view.ts_ms, coin, signal,
@@ -327,6 +371,30 @@ class ModelStrategy(BaseStrategy):
                 return []
 
         return self.orders_to_reach(view, coin, target_size, context)
+
+    # -- forced activity ---------------------------------------------------
+
+    def _idle_limit_description(self) -> str:
+        return f"{self._forced_after} bar(s)"
+
+    def _forced_entry(self, candidates: list[Candidate]) -> Candidate | None:
+        """The candidate to open purely because nothing else has been opened.
+
+        Only long: without a down-model a low P(up) means "do not buy", so
+        forcing a short here would be inventing a signal that does not exist.
+        """
+        if self.max_idle_bars is None or self._idle_bars < self.max_idle_bars:
+            return None
+        scored = [c for c in candidates if np.isfinite(c.signal.probability)]
+        if not scored:
+            return None
+        best = max(scored, key=lambda c: c.signal.probability)
+        self._forced_coin = best.signal.coin
+        log.info(
+            "forcing an entry after %d flat bar(s): %s at P(up) %.3f",
+            self._idle_bars, best.signal.coin, best.signal.probability,
+        )
+        return best
 
     # -- reporting ---------------------------------------------------------
 

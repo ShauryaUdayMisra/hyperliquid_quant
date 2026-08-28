@@ -178,7 +178,11 @@ def run_backtest(
 
     generator = SignalGenerator(model, long_threshold=long_threshold)
     risk = RiskEngine(limits, settings.execution)
-    strategy = ModelStrategy(generator, risk, matrices)
+    strategy = ModelStrategy(
+        generator, risk, matrices,
+        max_hold_ms=settings.strategy.max_hold_ms,
+        max_idle_bars=settings.strategy.idle_bars,
+    )
 
     exchange = PaperExchange(
         limits.starting_capital,
