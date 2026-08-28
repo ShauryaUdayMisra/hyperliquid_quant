@@ -378,6 +378,10 @@ class StrategyConfig:
     #: and re-entering is allowed, so a persistent signal survives.
     max_hold_hours: float = _env_float("MAX_HOLD_HOURS", 24.0)
 
+    #: A position is not closed on a fading probability before this age.
+    #: Risk exits -- the holding cap and liquidation -- ignore it.
+    min_hold_hours: float = _env_float("MIN_HOLD_HOURS", 4.0)
+
     #: After this many hours holding nothing, open the strongest candidate
     #: regardless of the entry threshold. Buys activity, not accuracy --
     #: these are by construction the trades the model was not confident
@@ -390,12 +394,16 @@ class StrategyConfig:
         return int(self.max_hold_hours * 3_600_000) if self.max_hold_hours > 0 else None
 
     @property
+    def min_hold_ms(self) -> int | None:
+        return int(self.min_hold_hours * 3_600_000) if self.min_hold_hours > 0 else None
+
+    @property
     def max_idle_ms(self) -> int | None:
         return int(self.max_idle_hours * 3_600_000) if self.max_idle_hours > 0 else None
 
     def describe(self) -> str:
-        hold = (f"close after {self.max_hold_hours:g}h"
-                if self.max_hold_ms else "no holding cap")
+        hold = (f"hold {self.min_hold_hours:g}-{self.max_hold_hours:g}h"
+                if self.max_hold_ms else f"minimum hold {self.min_hold_hours:g}h")
         idle = (f"force an entry after {self.max_idle_hours:g}h flat"
                 if self.max_idle_ms else "never force an entry")
         return f"{hold}; {idle}"

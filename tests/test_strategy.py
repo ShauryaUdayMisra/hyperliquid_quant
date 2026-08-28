@@ -334,7 +334,8 @@ def test_the_drift_warning_fires_once_per_market(system) -> None:
 # Activity rules: the holding cap and the idle timer
 # ==========================================================================
 
-def run_with_activity_rules(system, *, max_hold_ms=None, max_idle_ms=None,
+def run_with_activity_rules(system, *, max_hold_ms=None, min_hold_ms=None,
+                            max_idle_ms=None,
                             long_threshold=0.50, profile="conservative"):
     universe, matrices, generator = system
     generator.long_threshold = long_threshold
@@ -343,7 +344,8 @@ def run_with_activity_rules(system, *, max_hold_ms=None, max_idle_ms=None,
     risk = RiskEngine(limits, execution)
     strategy = ModelStrategy(
         generator, risk, matrices,
-        max_hold_ms=max_hold_ms, max_idle_ms=max_idle_ms,
+        max_hold_ms=max_hold_ms, min_hold_ms=min_hold_ms,
+        max_idle_ms=max_idle_ms,
     )
     exchange = PaperExchange(
         limits.starting_capital, config=execution, simulator=FillSimulator(execution)
@@ -597,3 +599,35 @@ def test_a_forced_entry_does_not_exceed_the_position_limit(system) -> None:
     # Slots already occupied are not double-filled.
     fewer = strategy._forced_entries(candidates, ts_ms=10_000_000, held=2)
     assert len(fewer) == limits.max_open_positions - 2
+
+
+def test_a_position_is_not_closed_on_a_fade_before_the_minimum_hold(system) -> None:
+    """The two activity rules were fighting each other.
+
+    A forced entry is opened *below* the entry threshold by definition, so
+    on the very next bar the same probability reads as "below the exit
+    threshold" and closes it. 72.5% of round trips lasted exactly one hour.
+    """
+    _, churning = run_with_activity_rules(
+        system, max_idle_ms=3_600_000, min_hold_ms=None, long_threshold=0.999
+    )
+    _, patient = run_with_activity_rules(
+        system, max_idle_ms=3_600_000, min_hold_ms=4 * 3_600_000,
+        long_threshold=0.999,
+    )
+    early = [d for d in patient.decisions if "minimum hold" in d.action]
+    assert early, "the minimum hold never prevented an exit"
+
+    churn_exits = [d for d in churning.decisions if d.action.startswith("close long")]
+    patient_exits = [d for d in patient.decisions if d.action.startswith("close long")]
+    assert len(patient_exits) < len(churn_exits)
+
+
+def test_the_holding_cap_still_outranks_the_minimum_hold(system) -> None:
+    """A minimum hold is an opinion; the cap and liquidation are risk."""
+    _, strategy = run_with_activity_rules(
+        system, max_hold_ms=2 * 3_600_000, min_hold_ms=12 * 3_600_000,
+        max_idle_ms=3_600_000, long_threshold=0.999,
+    )
+    capped = [d for d in strategy.decisions if "holding cap" in d.action]
+    assert capped, "the minimum hold suppressed the risk exit above it"

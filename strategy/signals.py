@@ -66,6 +66,7 @@ class ModelStrategy(BaseStrategy):
         min_rebalance_fraction: float = 0.25,
         atr_column: str = "vol_atr_14",
         max_hold_ms: int | None = None,
+        min_hold_ms: int | None = None,
         max_idle_ms: int | None = None,
         idle_since_ms: int | None = None,
         precompute: bool = True,
@@ -89,6 +90,14 @@ class ModelStrategy(BaseStrategy):
         #: being held on nothing -- the forecast it was opened on expired.
         #: None disables the cap.
         self.max_hold_ms = max_hold_ms
+        #: A position may not be closed on a fading probability before this
+        #: age. Without it the two activity rules fight each other: a forced
+        #: entry is opened *below* the entry bar by definition, so the very
+        #: next bar reads the same probability as "below the exit bar" and
+        #: closes it. That produced 72.5% of round trips lasting exactly one
+        #: hour and a 17.9% win rate -- the spread paid twice an hour for
+        #: nothing. Risk exits (the holding cap, liquidation) ignore this.
+        self.min_hold_ms = min_hold_ms
         #: After this long holding nothing, take the strongest candidate
         #: even though it did not clear the entry threshold. This buys
         #: activity, not accuracy: the trades it forces are by definition
@@ -297,6 +306,10 @@ class ModelStrategy(BaseStrategy):
             desired = 0.0
             action = (f"close: held {age_ms / 3_600_000:.1f}h, at or past the "
                       f"{self.max_hold_ms / 3_600_000:.0f}h holding cap")
+        elif self._too_young_to_fade(age_ms) and abs(current_size) > 1e-12:
+            desired = np.sign(current_size)
+            action = (f"hold: {age_ms / 3_600_000:.1f}h old, under the "
+                      f"{self.min_hold_ms / 3_600_000:.0f}h minimum hold")
         elif current_size > 0 and signal.probability < self.exit_threshold:
             desired = 0.0
             action = f"close long: P(up) {signal.probability:.3f} below exit {self.exit_threshold:.2f}"
@@ -382,6 +395,12 @@ class ModelStrategy(BaseStrategy):
         return self.orders_to_reach(view, coin, target_size, context)
 
     # -- forced activity ---------------------------------------------------
+
+    def _too_young_to_fade(self, age_ms: int | None) -> bool:
+        """Whether a fading probability is allowed to close this position yet."""
+        if self.min_hold_ms is None or age_ms is None:
+            return False
+        return age_ms < self.min_hold_ms
 
     def idle_ms(self, ts_ms: int) -> int:
         """How long the account has been holding nothing."""

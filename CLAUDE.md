@@ -54,6 +54,16 @@ same close.
 `MarketView` and calls the same `ModelStrategy.on_bar`. Do not fork this
 logic — divergence would make the backtest stop being evidence about live.
 
+**The activity rules can fight each other.** A forced entry is opened
+*below* the entry threshold by definition, so on the very next bar the same
+probability reads as "below the exit threshold" and closes it. That made
+72.5% of round trips last exactly one hour at a 17.9% win rate: the spread
+paid twice an hour for nothing, −99.91% over the backtest. `MIN_HOLD_HOURS`
+is the floor that stops it. Measured, 3 markets, aggressive, $10k positions:
+0h → 1,977 trades and −99.91%; 2h → 1,398 and −83.01%; 4h → 1,056 and
+−60.35%; 8h → 721 and −42.66%. Turnover and ruin move together — pick the
+point on that curve deliberately, and never remove the floor entirely.
+
 **Activity rules sit outside the model** (`strategy/signals.py`,
 `config.settings.StrategyConfig`). `MAX_HOLD_HOURS` force-closes any position
 past its age regardless of how good the probability still looks; re-entry on
@@ -179,7 +189,9 @@ trade rather than sit flat. Railway variables now:
 | `MAX_HOLD_HOURS` | `24` | Nothing is held longer; re-entry allowed. |
 | `MAX_IDLE_HOURS` | `0.75` | Force an entry after 45min holding nothing. Shorter than the 1h decision interval, so in practice it means "never be flat at a decision". |
 | `MARKETS` | `top:25` | The 25 most traded perps, resolved at startup. `all` (~176) is supported; see DEPLOY.md for the cost. |
-| `MAX_OPEN_POSITIONS` | `8` | Held at once. A forced entry fills every free slot, not just one. |
+| `MAX_OPEN_POSITIONS` | `20` | Held at once. A forced entry fills every free slot, not just one. |
+| `MAX_POSITION_USD` | `10000` | Per position. 20 x $10k = $200k gross on $100k equity, i.e. 2x used of the 10x allowed. |
+| `MIN_HOLD_HOURS` | `4` | A fading probability may not close a position younger than this. Risk exits ignore it. |
 
 He was shown the measured consequences and chose this anyway. **Do not
 quietly re-tighten these.** If the account collapses or liquidates, that is

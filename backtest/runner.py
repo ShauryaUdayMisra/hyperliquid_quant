@@ -181,6 +181,7 @@ def run_backtest(
     strategy = ModelStrategy(
         generator, risk, matrices,
         max_hold_ms=settings.strategy.max_hold_ms,
+        min_hold_ms=settings.strategy.min_hold_ms,
         max_idle_ms=settings.strategy.max_idle_ms,
     )
 

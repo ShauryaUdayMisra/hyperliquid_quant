@@ -139,6 +139,7 @@ class PaperTrader:
         self.strategy = ModelStrategy(
             self.generator, self.risk, {}, precompute=False,
             max_hold_ms=self.settings.strategy.max_hold_ms,
+            min_hold_ms=self.settings.strategy.min_hold_ms,
             max_idle_ms=self.settings.strategy.max_idle_ms,
             idle_since_ms=restored.get("idle_since_ms"),
         )
