@@ -24,7 +24,8 @@ python -c "from config.settings import SETTINGS; print('   ', SETTINGS.risk.desc
 # 1. Market data. Skipped when a volume already holds it.
 if [ ! -d storage/parquet/candles ]; then
   echo "==> No stored candles. Backfilling ${BACKFILL_DAYS} days at ${INTERVAL}..."
-  python main.py backfill --days "${BACKFILL_DAYS}" --intervals "${INTERVAL}"
+  python main.py backfill --days "${BACKFILL_DAYS}" --intervals "${INTERVAL}" || \
+    echo "!! backfill hit errors (often rate limiting); continuing with what landed"
 else
   echo "==> Candle store found; the trader will top it up on its first cycle."
 fi

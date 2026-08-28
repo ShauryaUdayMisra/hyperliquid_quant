@@ -8,3 +8,4 @@ certs/*.pem
 models/*.pkl
 .pytest_cache/
 .DS_Store
+.railway_dashboard_password

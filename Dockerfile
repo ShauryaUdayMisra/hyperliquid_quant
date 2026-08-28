@@ -42,6 +42,10 @@ EXPOSE 8000
 # then fixes volume ownership and drops root.
 ENTRYPOINT ["tini", "--", "/app/deploy/entrypoint.sh"]
 
-# Default: collector only. Railway overrides this with deploy/start.sh, which
-# runs the trader and the dashboard together against one shared volume.
-CMD ["python", "main.py", "collect"]
+# Full system by default: backfill, train, trade, serve the dashboard.
+#
+# This used to default to the collector and rely on the platform overriding
+# it. Railway ignored railway.json's startCommand and silently ran the
+# collector instead, so the default is now the thing we actually want and
+# docker-compose overrides it explicitly for the collector-only service.
+CMD ["bash", "deploy/start.sh"]
