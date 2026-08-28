@@ -339,7 +339,10 @@ class ReportConfig:
     smtp_user: str = _env("SMTP_USER", "")
     smtp_app_password: str = os.getenv("SMTP_APP_PASSWORD", "")
     sender: str = _env("REPORT_SENDER", "")
-    recipient: str = _env("REPORT_RECIPIENT", "shaumonk@gmail.com")
+    #: No default. An address baked into source gets scraped from any
+    #: public repository, and a report silently going to the wrong
+    #: inbox is worse than one that refuses to send.
+    recipient: str = _env("REPORT_RECIPIENT", "")
     #: Local hours at which the 6-hourly report fires.
     schedule_hours: tuple[int, ...] = tuple(
         int(h) for h in _env("REPORT_HOURS", "0,6,12,18").split(",") if h.strip()
