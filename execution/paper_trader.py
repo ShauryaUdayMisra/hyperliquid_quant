@@ -255,9 +255,11 @@ class PaperTrader:
         except Exception as exc:  # noqa: BLE001
             log.warning("asset context poll failed; falling back to bar closes: %s", exc)
 
+        # Iterate the bars handed in, not self.coins: markets dropped
+        # earlier in the cycle are absent here by design, and looking them
+        # up by name raised a KeyError that undid the skip above.
         snapshots: dict[str, MarketSnapshot] = {}
-        for coin in self.coins:
-            frame = bars[coin]
+        for coin, frame in bars.items():
             if frame.empty:
                 continue
             last = frame.iloc[-1]

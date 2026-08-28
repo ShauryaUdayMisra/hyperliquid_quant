@@ -48,10 +48,24 @@ def test_delisted_and_untraded_markets_are_dropped() -> None:
     assert rank_by_volume(m, ctxs(100, 900, 0)) == ["LIVE"]
 
 
+def test_the_exchanges_own_casing_is_preserved() -> None:
+    """Hyperliquid lists "kPEPE", not "KPEPE".
+
+    Upper-casing the name produced a market that every later API call failed
+    to find: it could never be refreshed, never had bars, and took the whole
+    trading cycle down with it.
+    """
+    ranked = rank_by_volume(meta("kPEPE", "BTC", "kBONK"), ctxs(9, 8, 7))
+    assert ranked == ["kPEPE", "BTC", "kBONK"]
+
+
 def test_stablecoins_are_never_traded() -> None:
     names = tuple(EXCLUDED) + ("BTC",)
     ranked = rank_by_volume(meta(*names), ctxs(*([9_000] * len(EXCLUDED)), 1))
     assert ranked == ["BTC"]
+
+    # ...whatever case they are listed in.
+    assert rank_by_volume(meta("usdc", "BTC"), ctxs(9_000, 1)) == ["BTC"]
 
 
 def test_mismatched_universe_and_contexts_raise_rather_than_pair_up_blindly() -> None:

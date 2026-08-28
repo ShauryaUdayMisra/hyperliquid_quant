@@ -28,6 +28,8 @@ from typing import Any, Iterable, Sequence
 log = logging.getLogger(__name__)
 
 #: Never trade these even when they rank, whatever the spec says.
+#: Compared case-insensitively; the exchange's own casing is preserved
+#: everywhere else because names like "kPEPE" are not upper-case.
 EXCLUDED = frozenset({"USDC", "USDT"})
 
 
@@ -75,8 +77,11 @@ def rank_by_volume(meta: dict[str, Any], contexts: Sequence[dict[str, Any]]) -> 
 
     ranked: list[tuple[float, str]] = []
     for asset, context in zip(universe, contexts):
-        name = str(asset.get("name", "")).upper()
-        if not name or name in EXCLUDED or asset.get("isDelisted"):
+        # The exchange's own casing is authoritative. Upper-casing turned
+        # "kPEPE" into "KPEPE", which every later API call then failed to
+        # find -- a market that could never be refreshed and never had bars.
+        name = str(asset.get("name", "")).strip()
+        if not name or name.upper() in EXCLUDED or asset.get("isDelisted"):
             continue
         try:
             volume = float(context.get("dayNtlVlm") or 0.0)
@@ -105,7 +110,7 @@ def resolve(raw: str, client: Any, *, fallback: Iterable[str] = ()) -> tuple[str
         meta, contexts = client.meta_and_asset_ctxs()
         ranked = rank_by_volume(meta, contexts)
     except Exception as exc:  # noqa: BLE001 - degrade, never abort startup
-        chosen = tuple(dict.fromkeys(c.upper() for c in fallback))
+        chosen = tuple(dict.fromkeys(fallback))
         log.warning(
             "could not resolve MARKETS='%s' against the exchange (%s); "
             "falling back to %s", raw, exc, list(chosen) or "nothing",

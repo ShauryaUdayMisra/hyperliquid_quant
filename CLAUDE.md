@@ -125,6 +125,12 @@ plants a deliberate leak to prove the checker works.
   first and outlasts `healthcheckTimeout` kills a container that is working.
   At `MARKETS=top:25` the cold-volume backfill does exactly that. `start.sh`
   now starts uvicorn in the background first and waits on it last.
+- **Do not normalise coin names from the exchange.** Hyperliquid lists
+  `kPEPE`, `kBONK` and friends in mixed case. Upper-casing them in
+  `data/universe.py` produced `KPEPE`, which no later API call could find:
+  it could never be refreshed, never had bars, and took the whole cycle
+  down. Explicit `MARKETS` values are still upper-cased for typing
+  convenience; exchange-derived names are passed through untouched.
 - **In a wide universe, one bad market must never stop the rest.** This has
   now bitten three times in three places: an unhandled 429 in
   `_refresh_market_data`, an empty frame in `run_cycle` ("a market has no
