@@ -17,7 +17,10 @@ data in, simulated fills out, $100,000 of virtual money.
    exception is `models/labels.py`, the only module allowed to look forward,
    and only for training targets.
 3. **The risk engine has final say.** A 99%-confidence signal is rejected if a
-   limit binds. Never let the strategy bypass `risk/risk_engine.py`.
+   limit binds. Never let the strategy bypass `risk/risk_engine.py`. The
+   *limits themselves* are the owner's to set, and as of 2026-08-28 he has
+   set them wide open — see "How it is configured live" below. Structure
+   stays; numbers are his call.
 4. **Realistic execution.** Costs are always on. Never disable them to make a
    backtest look better.
 5. **Implausible results are bugs.** A high Sharpe or a spectacular return is
@@ -116,6 +119,23 @@ plants a deliberate leak to prove the checker works.
   back to scikit-learn `HistGradientBoosting`. Linux/Docker uses LightGBM.
   Results are comparable in kind, not identical — the backend is recorded on
   every artefact.
+- **A platform healthcheck cannot present a password.** `railway.json`'s
+  `healthcheckPath` pointed at `/`, which is behind HTTP Basic auth and
+  answers 401, so Railway killed every new deployment after exactly
+  `healthcheckTimeout` (300s) while the app logs showed a healthy boot. The
+  tell is deployments failing at a round number of seconds. `/health` is
+  unauthenticated and returns only `{"status": "ok"}`.
+- **A position too small to trade is a position you cannot leave.**
+  `orders_to_reach` refuses trades under `min_trade_notional` to stop churn,
+  which also meant it refused to *close* a sub-$10 stub. The holding cap
+  fired on one such position every bar for 562 hours and was ignored every
+  time. Reductions that would leave less than the minimum now go to zero,
+  and exits are never suppressed for size.
+- **Clocks must be timestamps, not counters.** The idle timer counted flat
+  bars in memory, so every redeploy handed it zero and it could never reach
+  its limit on a service that restarts often. It is now `idle_since_ms`,
+  persisted in the state file's `extra` blob; position age likewise comes
+  from `Position.opened_ts_ms`.
 - **Never let label columns reach the feature list.** `label`,
   `forward_return` and `label_known` are excluded in two independent places.
   A missing exclusion once produced a perfect AUC 1.0000.
@@ -129,6 +149,33 @@ plants a deliberate leak to prove the checker works.
 - Money is float USD; time is int64 UTC epoch **milliseconds** (`ts_ms`) as
   the source of truth, with `ts` derived for convenience.
 - Ratios return `NaN`, never infinity, when their denominator is degenerate.
+
+## How it is configured live (2026-08-28)
+
+Shaurya asked to "remove all these guardrails" and to force the system to
+trade rather than sit flat. Railway variables now:
+
+| Variable | Value | Effect |
+| --- | --- | --- |
+| `RISK_PROFILE` | `aggressive` | 10x leverage, 100% of equity risked per trade, $100k max position, **daily-loss and drawdown halts off**. Liquidation still applies and is now the only backstop. |
+| `SIGNAL_THRESHOLD` | `0.40` | Was 0.55. Fires on ~25% of bars instead of ~7%. |
+| `MAX_HOLD_HOURS` | `24` | Nothing is held longer; re-entry allowed. |
+| `MAX_IDLE_HOURS` | `3` | Force an entry after 3h holding nothing. |
+
+He was shown the measured consequences and chose this anyway. **Do not
+quietly re-tighten these.** If the account collapses or liquidates, that is
+the configuration behaving as measured — report it plainly, do not treat it
+as a defect and do not "fix" it without being asked.
+
+The two things that were *not* removed, and should not be:
+
+- **Liquidation stays.** His own earlier instruction, and with the halts off
+  it is the only thing between a bad run and zero.
+- **Costs, causality checks and the accounting proof stay.** These do not
+  restrain the trading; they are what makes the reported numbers true.
+- **Real trading stays impossible.** Non-negotiable 1 is not his to waive by
+  implication; it would need an explicit, unambiguous request, and the answer
+  is still no.
 
 ## Current status
 

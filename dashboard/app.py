@@ -74,6 +74,10 @@ def require_auth(credentials: HTTPBasicCredentials | None = Depends(_security)) 
         )
 
 
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
 HOUR_MS = 3_600_000
 DAY_MS = 86_400_000
 
@@ -83,13 +87,18 @@ def _store() -> ParquetStore:
 
 
 def _load_account() -> PaperExchange:
+    exchange, _ = _load_account_and_extra()
+    return exchange
+
+
+def _load_account_and_extra() -> tuple[PaperExchange, dict]:
     exchange = PaperExchange(
         SETTINGS.risk.starting_capital,
         config=SETTINGS.execution,
         simulator=FillSimulator(SETTINGS.execution),
     )
-    StateStore(SETTINGS.paths.storage / "paper_account.json").load_into(exchange)
-    return exchange
+    extra = StateStore(SETTINGS.paths.storage / "paper_account.json").load_into(exchange)
+    return exchange, extra or {}
 
 
 def _query(sql: str, params=None) -> pd.DataFrame:
@@ -163,9 +172,26 @@ def api_equity(limit: int = 2000) -> JSONResponse:
 
 @app.get("/api/state", dependencies=[Depends(require_auth)])
 def api_state() -> JSONResponse:
-    exchange = _load_account()
+    exchange, extra = _load_account_and_extra()
     marks = {p.coin: p.entry_price for p in exchange.open_positions()}
+
+    # "Nothing is happening" is a question the dashboard should answer, so
+    # the activity rules and the running idle clock are shown rather than
+    # left to be inferred from an empty fills table.
+    idle_since = extra.get("idle_since_ms")
+    idle_ms = max(0, _now_ms() - int(idle_since)) if idle_since else None
+    max_idle_ms = SETTINGS.strategy.max_idle_ms
     return JSONResponse({
+        "activity": {
+            "max_hold_hours": SETTINGS.strategy.max_hold_hours,
+            "max_idle_hours": SETTINGS.strategy.max_idle_hours,
+            "idle_since_ms": idle_since,
+            "idle_hours": round(idle_ms / 3_600_000, 2) if idle_ms is not None else None,
+            "forced_entry_due_ms": (
+                int(idle_since) + max_idle_ms
+                if idle_since and max_idle_ms else None
+            ),
+        },
         "profile": SETTINGS.risk.name,
         "max_leverage": SETTINGS.risk.max_leverage,
         "max_positions": SETTINGS.risk.max_open_positions,
@@ -351,6 +377,7 @@ INDEX_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 </style></head><body><div class="wrap">
 <h1>Hyperliquid Paper Trading</h1>
 <p class="muted" id="sub">loading…</p>
+<p class="muted" id="rules"></p>
 <div id="banner"></div>
 
 <div class="pnl" id="pnl"></div>
@@ -404,6 +431,22 @@ async function load(){
   document.getElementById('sub').textContent =
     `${s.profile} profile · max ${s.max_leverage}x · ${s.max_positions} positions · `
     +`${s.closed_trades} round trips · ${s.fills} fills · ${s.liquidations} liquidation(s)`;
+
+  // An empty table should never leave you guessing whether the thing is
+  // broken or simply waiting. Say which, and say when it acts next.
+  const a = s.activity || {};
+  const rules = [];
+  if (a.max_hold_hours) rules.push(`closes any position after ${a.max_hold_hours}h`);
+  if (a.max_idle_hours) {
+    if (s.positions.length) {
+      rules.push(`forces an entry after ${a.max_idle_hours}h holding nothing`);
+    } else if (a.idle_hours != null) {
+      const left = Math.max(0, a.max_idle_hours - a.idle_hours);
+      rules.push(`flat for ${a.idle_hours.toFixed(1)}h — forces an entry in `
+                 + `${left.toFixed(1)}h if no signal clears first`);
+    }
+  }
+  document.getElementById('rules').textContent = rules.join(' · ');
 
   const notes=[];
   if(s.bankrupt) notes.push('<b>The account has been wiped out.</b> Trading has stopped.');
