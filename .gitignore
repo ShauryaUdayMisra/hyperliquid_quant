@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+storage/
+logs/
+certs/*.pem
+models/*.pkl
+.pytest_cache/
+.DS_Store

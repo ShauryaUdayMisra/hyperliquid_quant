@@ -1,0 +1,377 @@
+"""Central configuration for the Hyperliquid paper-trading research system.
+
+Everything that a human might want to tune lives here or in ``.env``.
+Nothing in this file may contain a secret; secrets are read from the
+environment only.
+
+SAFETY: this project is read-only with respect to Hyperliquid. It never
+signs a transaction and never holds a key that can move funds. The
+``assert_no_trading_credentials`` guard below is executed at import time
+so that an accidentally-populated key aborts the process immediately.
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(PROJECT_ROOT / ".env")
+
+
+# --------------------------------------------------------------------------
+# Safety guard
+# --------------------------------------------------------------------------
+
+#: Environment variables that would imply the ability to sign orders or move
+#: funds. If any of these is populated the process refuses to start.
+FORBIDDEN_ENV_VARS = (
+    "HL_PRIVATE_KEY",
+    "HYPERLIQUID_PRIVATE_KEY",
+    "PRIVATE_KEY",
+    "SECRET_KEY",
+    "WALLET_PRIVATE_KEY",
+    "HL_API_SECRET",
+)
+
+
+class TradingCredentialsPresent(RuntimeError):
+    """Raised when a credential capable of moving real funds is detected."""
+
+
+def assert_no_trading_credentials(env: dict[str, str] | None = None) -> None:
+    """Abort if the environment carries anything that could sign a trade."""
+    env = os.environ if env is None else env
+    found = [k for k in FORBIDDEN_ENV_VARS if (env.get(k) or "").strip()]
+    if found:
+        raise TradingCredentialsPresent(
+            "This system is paper-trading only and must never hold signing keys. "
+            f"Remove these environment variables before starting: {', '.join(found)}"
+        )
+
+
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
+
+def _env(name: str, default: str) -> str:
+    value = os.getenv(name)
+    return default if value is None or value == "" else value
+
+
+def _env_int(name: str, default: int) -> int:
+    return int(_env(name, str(default)))
+
+
+def _env_float(name: str, default: float) -> float:
+    return float(_env(name, str(default)))
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    return _env(name, "true" if default else "false").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _env_path_or_none(name: str) -> str | None:
+    value = os.getenv(name)
+    return value.strip() or None if value else None
+
+
+# --------------------------------------------------------------------------
+# Paths
+# --------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Paths:
+    root: Path = PROJECT_ROOT
+    storage: Path = PROJECT_ROOT / "storage"
+    parquet: Path = PROJECT_ROOT / "storage" / "parquet"
+    duckdb_file: Path = PROJECT_ROOT / "storage" / "db" / "market.duckdb"
+    logs: Path = PROJECT_ROOT / "logs"
+    models: Path = PROJECT_ROOT / "models"
+
+    def ensure(self) -> "Paths":
+        for p in (self.storage, self.parquet, self.duckdb_file.parent, self.logs):
+            p.mkdir(parents=True, exist_ok=True)
+        return self
+
+
+# --------------------------------------------------------------------------
+# Hyperliquid API
+# --------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class HyperliquidConfig:
+    """Public, read-only market-data endpoints."""
+
+    info_url: str = _env("HL_INFO_URL", "https://api.hyperliquid.xyz/info")
+    ws_url: str = _env("HL_WS_URL", "wss://api.hyperliquid.xyz/ws")
+
+    #: Optional PEM bundle used to verify TLS. Needed on networks where a
+    #: corporate firewall (e.g. FortiGate) performs SSL inspection. Leave
+    #: unset to use the system trust store, which is the correct default.
+    ca_bundle: str | None = _env_path_or_none("HL_CA_BUNDLE")
+
+    request_timeout_s: float = _env_float("HL_REQUEST_TIMEOUT_S", 20.0)
+    max_retries: int = _env_int("HL_MAX_RETRIES", 5)
+    backoff_base_s: float = _env_float("HL_BACKOFF_BASE_S", 0.5)
+    backoff_max_s: float = _env_float("HL_BACKOFF_MAX_S", 30.0)
+
+    #: Hyperliquid budgets the /info endpoint by request weight, 1200 per
+    #: minute per IP. We stay well under it.
+    rate_limit_per_minute: int = _env_int("HL_RATE_LIMIT_PER_MINUTE", 600)
+
+    #: Hard server-side cap on rows returned by a single candleSnapshot call.
+    candle_page_limit: int = 5000
+
+    #: Seconds between WebSocket keepalive pings (server drops idle at 60s).
+    ws_ping_interval_s: float = _env_float("HL_WS_PING_INTERVAL_S", 45.0)
+
+    def verify(self) -> str | bool:
+        """Value to hand to httpx/ssl as the ``verify`` argument."""
+        return self.ca_bundle if self.ca_bundle else True
+
+
+# --------------------------------------------------------------------------
+# Data layer
+# --------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class DataConfig:
+    #: Markets we collect and (later) trade. Hyperliquid perp coin names.
+    markets: tuple[str, ...] = tuple(
+        m.strip().upper() for m in _env("MARKETS", "BTC,ETH,SOL").split(",") if m.strip()
+    )
+
+    #: Candle intervals to backfill and keep in sync.
+    candle_intervals: tuple[str, ...] = tuple(
+        i.strip() for i in _env("CANDLE_INTERVALS", "1m,5m,1h").split(",") if i.strip()
+    )
+
+    #: How far back the initial historical backfill reaches.
+    backfill_days: int = _env_int("BACKFILL_DAYS", 180)
+
+    #: Seconds between live order-book snapshots written by the collector.
+    orderbook_snapshot_interval_s: float = _env_float("ORDERBOOK_SNAPSHOT_INTERVAL_S", 10.0)
+
+    #: Order-book depth (levels per side) retained in a snapshot.
+    orderbook_depth: int = _env_int("ORDERBOOK_DEPTH", 20)
+
+    #: Seconds between asset-context (funding / OI / mark) polls.
+    asset_ctx_interval_s: float = _env_float("ASSET_CTX_INTERVAL_S", 60.0)
+
+    #: Flush the in-memory buffers to Parquet at least this often.
+    flush_interval_s: float = _env_float("FLUSH_INTERVAL_S", 60.0)
+
+    #: A timestamp more than this far in the future is data corruption.
+    #: Small positive tolerance absorbs exchange/host clock skew.
+    future_timestamp_tolerance_s: float = _env_float("FUTURE_TS_TOLERANCE_S", 5.0)
+
+
+#: Candle interval -> milliseconds. Used for gap detection.
+INTERVAL_MS: dict[str, int] = {
+    "1m": 60_000,
+    "3m": 180_000,
+    "5m": 300_000,
+    "15m": 900_000,
+    "30m": 1_800_000,
+    "1h": 3_600_000,
+    "2h": 7_200_000,
+    "4h": 14_400_000,
+    "8h": 28_800_000,
+    "12h": 43_200_000,
+    "1d": 86_400_000,
+}
+
+#: Hyperliquid funds perpetuals every hour.
+FUNDING_INTERVAL_MS = 3_600_000
+
+
+# --------------------------------------------------------------------------
+# Risk limits
+#
+# Two named profiles, selected with RISK_PROFILE in .env, so the same code
+# can be run twice and the results compared. The risk engine is identical in
+# both cases -- it always sizes positions, tracks margin and enforces
+# liquidation. Only the numbers it enforces change.
+# --------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class RiskLimits:
+    """Hard limits the risk engine enforces. The engine may veto any signal."""
+
+    name: str = "conservative"
+    starting_capital: float = 100_000.0
+    max_position_usd: float = 10_000.0
+    max_leverage: float = 2.0
+    #: Fraction of equity risked per trade (distance to stop x size).
+    risk_per_trade: float = 0.0025
+    #: Trading halts for the rest of the UTC day past this loss fraction.
+    max_daily_loss: float = 0.02
+    #: Trading halts entirely past this peak-to-trough equity drawdown.
+    max_portfolio_dd: float = 0.10
+    max_open_positions: int = 3
+
+    @property
+    def daily_loss_cap_active(self) -> bool:
+        return self.max_daily_loss < 1.0
+
+    @property
+    def drawdown_cap_active(self) -> bool:
+        return self.max_portfolio_dd < 1.0
+
+    def describe(self) -> str:
+        return (
+            f"risk profile '{self.name}': capital=${self.starting_capital:,.0f} "
+            f"max_pos=${self.max_position_usd:,.0f} lev={self.max_leverage}x "
+            f"risk/trade={self.risk_per_trade:.2%} "
+            f"daily_loss={'off' if not self.daily_loss_cap_active else f'{self.max_daily_loss:.1%}'} "
+            f"max_dd={'off' if not self.drawdown_cap_active else f'{self.max_portfolio_dd:.1%}'} "
+            f"max_positions={self.max_open_positions}"
+        )
+
+
+#: The original brief's limits. Survivable, slow, hard to blow up.
+CONSERVATIVE_RISK = RiskLimits(
+    name="conservative",
+    max_position_usd=10_000.0,
+    max_leverage=2.0,
+    risk_per_trade=0.0025,
+    max_daily_loss=0.02,
+    max_portfolio_dd=0.10,
+    max_open_positions=3,
+)
+
+#: Full-deployment, high-leverage profile with the circuit breakers removed.
+#: Position sizing, margin tracking and liquidation still apply -- with no
+#: daily-loss or drawdown halt, liquidation becomes the ONLY backstop.
+AGGRESSIVE_RISK = RiskLimits(
+    name="aggressive",
+    max_position_usd=100_000.0,
+    max_leverage=10.0,
+    risk_per_trade=1.0,
+    max_daily_loss=1.0,
+    max_portfolio_dd=1.0,
+    max_open_positions=3,
+)
+
+RISK_PROFILES: dict[str, RiskLimits] = {
+    "conservative": CONSERVATIVE_RISK,
+    "aggressive": AGGRESSIVE_RISK,
+}
+
+
+def resolve_risk_profile(name: str | None = None) -> RiskLimits:
+    """Look up a profile, then apply any per-field .env overrides."""
+    key = (name or _env("RISK_PROFILE", "aggressive")).strip().lower()
+    if key not in RISK_PROFILES:
+        raise ValueError(
+            f"unknown RISK_PROFILE '{key}'; choose one of {sorted(RISK_PROFILES)}"
+        )
+    base = RISK_PROFILES[key]
+    return RiskLimits(
+        name=base.name,
+        starting_capital=_env_float("STARTING_CAPITAL", base.starting_capital),
+        max_position_usd=_env_float("MAX_POSITION_USD", base.max_position_usd),
+        max_leverage=_env_float("MAX_LEVERAGE", base.max_leverage),
+        risk_per_trade=_env_float("RISK_PER_TRADE", base.risk_per_trade),
+        max_daily_loss=_env_float("MAX_DAILY_LOSS", base.max_daily_loss),
+        max_portfolio_dd=_env_float("MAX_PORTFOLIO_DD", base.max_portfolio_dd),
+        max_open_positions=_env_int("MAX_OPEN_POSITIONS", base.max_open_positions),
+    )
+
+
+# --------------------------------------------------------------------------
+# Execution realism (Phase 2 paper exchange)
+# --------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ExecutionConfig:
+    """Costs and frictions the paper exchange charges.
+
+    Defaults are Hyperliquid's base-tier perp fees. They are deliberately
+    pessimistic where the true value is unknowable in a backtest.
+    """
+
+    taker_fee: float = _env_float("TAKER_FEE", 0.00045)   # 4.5 bps
+    maker_fee: float = _env_float("MAKER_FEE", 0.00015)   # 1.5 bps
+
+    #: Half-spread applied to every market order, as a fraction of price,
+    #: used when no live order book is available for the bar.
+    default_half_spread: float = _env_float("DEFAULT_HALF_SPREAD", 0.00005)
+
+    #: Square-root market-impact coefficient: impact = k * sqrt(notional / adv).
+    impact_coefficient: float = _env_float("IMPACT_COEFFICIENT", 0.10)
+
+    #: Round-trip decision-to-fill delay. Signals act on the NEXT bar anyway;
+    #: this adds sub-bar slippage on top.
+    latency_ms: int = _env_int("LATENCY_MS", 250)
+
+    #: A single order may not consume more than this share of a bar's volume.
+    #: Anything beyond it becomes a partial fill.
+    max_bar_volume_share: float = _env_float("MAX_BAR_VOLUME_SHARE", 0.10)
+
+    #: Maintenance-margin fraction fallback when an asset's max leverage is
+    #: unknown. Hyperliquid uses half the initial margin at max leverage,
+    #: i.e. 1 / (2 * max_leverage).
+    default_max_asset_leverage: float = _env_float("DEFAULT_MAX_ASSET_LEVERAGE", 20.0)
+
+    #: Extra cost charged when a position is force-closed by liquidation.
+    liquidation_penalty: float = _env_float("LIQUIDATION_PENALTY", 0.01)
+
+    def maintenance_margin_fraction(self, max_asset_leverage: float | None = None) -> float:
+        leverage = max_asset_leverage or self.default_max_asset_leverage
+        return 1.0 / (2.0 * leverage)
+
+
+# --------------------------------------------------------------------------
+# Reporting (Phase 7 — configured here, not used yet)
+# --------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ReportConfig:
+    smtp_host: str = _env("SMTP_HOST", "smtp.gmail.com")
+    smtp_port: int = _env_int("SMTP_PORT", 587)
+    smtp_user: str = _env("SMTP_USER", "")
+    smtp_app_password: str = os.getenv("SMTP_APP_PASSWORD", "")
+    sender: str = _env("REPORT_SENDER", "")
+    recipient: str = _env("REPORT_RECIPIENT", "shaumonk@gmail.com")
+    #: Local hours at which the 6-hourly report fires.
+    schedule_hours: tuple[int, ...] = tuple(
+        int(h) for h in _env("REPORT_HOURS", "0,6,12,18").split(",") if h.strip()
+    )
+    enabled: bool = _env_bool("REPORT_ENABLED", False)
+
+
+# --------------------------------------------------------------------------
+# Root settings object
+# --------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Settings:
+    paths: Paths = field(default_factory=Paths)
+    hyperliquid: HyperliquidConfig = field(default_factory=HyperliquidConfig)
+    data: DataConfig = field(default_factory=DataConfig)
+    risk: RiskLimits = field(default_factory=resolve_risk_profile)
+    execution: ExecutionConfig = field(default_factory=ExecutionConfig)
+    report: ReportConfig = field(default_factory=ReportConfig)
+
+    #: Global kill-switch documenting intent. Nothing in this repo may place
+    #: a real order regardless of its value.
+    paper_trading_only: bool = True
+
+    log_level: str = _env("LOG_LEVEL", "INFO")
+
+
+def get_settings() -> Settings:
+    assert_no_trading_credentials()
+    settings = Settings()
+    settings.paths.ensure()
+    return settings
+
+
+SETTINGS = get_settings()

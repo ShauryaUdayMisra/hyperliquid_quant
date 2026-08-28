@@ -1,0 +1,61 @@
+# Deploy with:  docker compose -f deploy/docker-compose.yml up -d --build
+#
+# Run from the repo root; the build context is the parent directory.
+
+services:
+  collector:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: hlquant:latest
+    container_name: hlquant-collector
+    command: ["python", "main.py", "collect"]
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    volumes:
+      # Market data must outlive the container. This is the only state that
+      # cannot be rebuilt: order books and trades have no historical API.
+      - ../storage:/app/storage
+      - ../logs:/app/logs
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    stop_grace_period: 90s
+
+  # Live paper trading plus the 6-hour report scheduler. Requires a trained
+  # model at models/model.pkl -- run `python main.py train` first.
+  paper-trader:
+    image: hlquant:latest
+    container_name: hlquant-trader
+    command: ["python", "main.py", "paper"]
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    volumes:
+      - ../storage:/app/storage
+      - ../logs:/app/logs
+      - ../models:/app/models
+    depends_on:
+      - collector
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "5"}
+    stop_grace_period: 60s
+
+  # Read-only dashboard. Bound to localhost deliberately: there is no
+  # authentication. Reach it with `ssh -L 8000:localhost:8000 user@host`.
+  dashboard:
+    image: hlquant:latest
+    container_name: hlquant-dashboard
+    command: ["uvicorn", "dashboard.app:app", "--host", "0.0.0.0", "--port", "8000"]
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    volumes:
+      - ../storage:/app/storage
+      - ../models:/app/models
+    ports:
+      - "127.0.0.1:8000:8000"

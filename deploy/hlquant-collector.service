@@ -1,0 +1,45 @@
+# Systemd unit for running the collector directly on a Linux VM, without
+# Docker. Install with:
+#
+#   sudo cp deploy/hlquant-collector.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now hlquant-collector
+#
+# Adjust User and paths if you did not clone to /opt/hyperliquid-quant.
+
+[Unit]
+Description=Hyperliquid paper-trading market data collector
+Documentation=file:///opt/hyperliquid-quant/deploy/DEPLOY.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=quant
+Group=quant
+WorkingDirectory=/opt/hyperliquid-quant
+ExecStart=/opt/hyperliquid-quant/.venv/bin/python main.py collect
+
+# Restart forever. A dropped WebSocket or a rebooted host must not end
+# collection silently -- lost order-book data is unrecoverable.
+Restart=always
+RestartSec=10s
+
+# Give the collector time to flush its buffers to Parquet on shutdown.
+KillSignal=SIGTERM
+TimeoutStopSec=90s
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hlquant
+
+# Hardening: this process only ever reads public market data and writes
+# Parquet. It has no business touching anything else.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/hyperliquid-quant/storage /opt/hyperliquid-quant/logs
+
+[Install]
+WantedBy=multi-user.target
