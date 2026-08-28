@@ -631,3 +631,52 @@ def test_the_holding_cap_still_outranks_the_minimum_hold(system) -> None:
     )
     capped = [d for d in strategy.decisions if "holding cap" in d.action]
     assert capped, "the minimum hold suppressed the risk exit above it"
+
+
+def test_a_market_gated_out_for_sparse_features_says_so(system, caplog) -> None:
+    """Silence here is indistinguishable from "the model had no opinion".
+
+    A market whose features are too sparse produces no decision record and
+    no order, which on the dashboard looks exactly like a flat call. BTC
+    disappeared from a 25-market universe this way with nothing logged.
+    """
+    import logging
+
+    import numpy as np
+    import pandas as pd
+
+    universe, matrices, generator = system
+    limits = resolve_risk_profile("conservative")
+    strategy = ModelStrategy(
+        generator, RiskEngine(limits, ExecutionConfig()), {}, precompute=False
+    )
+
+    coin = next(iter(matrices))
+    frame = matrices[coin].tail(1).copy()
+    for column in list(generator.model.features)[: int(len(generator.model.features) * 0.6)]:
+        frame[column] = np.nan
+    strategy.features = {coin: frame}
+
+    with caplog.at_level(logging.WARNING, logger="strategy.signals"):
+        assert strategy._signal_for(coin, 0) is None
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("will not be scored" in m for m in messages), \
+        "the market was dropped silently"
+    assert any("70%" in m for m in messages), "the warning omits the gate"
+
+
+def test_a_healthy_market_logs_no_warmup_warning(system, caplog) -> None:
+    import logging
+
+    universe, matrices, generator = system
+    limits = resolve_risk_profile("conservative")
+    strategy = ModelStrategy(
+        generator, RiskEngine(limits, ExecutionConfig()), {}, precompute=False
+    )
+    coin = next(iter(matrices))
+    strategy.features = {coin: matrices[coin].tail(1).copy()}
+
+    with caplog.at_level(logging.WARNING, logger="strategy.signals"):
+        assert strategy._signal_for(coin, 0) is not None
+    assert not [r for r in caplog.records if "will not be scored" in r.getMessage()]

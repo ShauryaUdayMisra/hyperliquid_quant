@@ -113,6 +113,7 @@ class ModelStrategy(BaseStrategy):
         self.decisions: list[DecisionRecord] = []
         self._signal_cache: dict[str, list[Signal | None]] = {}
         self._warned_missing: set[str] = set()
+        self._warned_warmup: set[str] = set()
         if precompute:
             self._precompute_signals()
 
@@ -187,9 +188,22 @@ class ModelStrategy(BaseStrategy):
                 )
             row = row.reindex(columns=list(row.columns) + missing)
         # A row that is still warming up cannot produce a trustworthy
-        # probability, so no signal is generated at all.
-        populated = row[self.generator.model.features].notna().mean(axis=1).iloc[0]
+        # probability, so no signal is generated at all. Say so: a market
+        # dropped here produces no decision record and no order, which on
+        # the dashboard is indistinguishable from a market the model simply
+        # had no opinion about. BTC vanished from a 25-market universe this
+        # way and nothing anywhere said why.
+        features = self.generator.model.features
+        populated = row[features].notna().mean(axis=1).iloc[0]
         if populated < 0.7:
+            if coin not in self._warned_warmup:
+                self._warned_warmup.add(coin)
+                absent = [c for c in features if bool(row[c].isna().iloc[0])]
+                log.warning(
+                    "%s: only %.0f%% of the model's %d features are populated "
+                    "(gate is 70%%), so it will not be scored. Missing e.g. %s",
+                    coin, 100 * populated, len(features), absent[:8],
+                )
             return None
         return self.generator.generate(row, coin=coin)[0]
 
