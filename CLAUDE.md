@@ -54,12 +54,14 @@ logic — divergence would make the backtest stop being evidence about live.
 **Activity rules sit outside the model** (`strategy/signals.py`,
 `config.settings.StrategyConfig`). `MAX_HOLD_HOURS` force-closes any position
 past its age regardless of how good the probability still looks; re-entry on
-a later bar is allowed. `MAX_IDLE_BARS` opens the strongest candidate after
-that many consecutive flat bars even though it never cleared the entry
-threshold. Both buy activity, not accuracy — the forced trades are by
-construction the ones the model was not confident enough to ask for. Position
-age is read from `Position.opened_ts_ms`, never counted in the strategy, so a
-live restart cannot hand every open position a fresh clock.
+a later bar is allowed. `MAX_IDLE_HOURS` opens the strongest candidate after
+that long holding nothing, even though it never cleared the entry threshold. Both buy activity, not accuracy — the forced trades are by
+construction the ones the model was not confident enough to ask for. Both
+clocks are timestamps, never counters: position age comes from
+`Position.opened_ts_ms` and the idle clock is persisted in the state file's
+`extra` blob and restored on boot. Counted in memory, each redeploy reset them
+— and a service that redeploys more often than the idle limit could never fire
+the timer at all.
 
 **A position you cannot close is unbounded risk.** `orders_to_reach` refuses
 trades under `min_trade_notional` to stop churn. Left alone, that guard also

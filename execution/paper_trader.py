@@ -118,10 +118,15 @@ class PaperTrader:
         restored = self.state_store.load_into(self.exchange)
         self._started_ms = int(restored.get("started_ms", time.time() * 1000))
 
+        # The idle clock is restored, not restarted. Counting flat bars in
+        # memory meant every redeploy handed the timer a fresh zero, so on a
+        # service that redeploys more often than the limit it could never
+        # fire and the system stayed flat indefinitely.
         self.strategy = ModelStrategy(
             self.generator, self.risk, {}, precompute=False,
             max_hold_ms=self.settings.strategy.max_hold_ms,
-            max_idle_bars=self.settings.strategy.idle_bars,
+            max_idle_ms=self.settings.strategy.max_idle_ms,
+            idle_since_ms=restored.get("idle_since_ms"),
         )
         self.feature_config = FeatureConfig(interval=interval)
         self._stop = asyncio.Event()
@@ -298,7 +303,10 @@ class PaperTrader:
             )
 
             self._record(result, marks)
-            self.state_store.save(self.exchange, extra={"started_ms": self._started_ms})
+            self.state_store.save(self.exchange, extra={
+                "started_ms": self._started_ms,
+                "idle_since_ms": self.strategy.idle_since_ms,
+            })
             self.cycles += 1
             log.info("cycle %d | %s", self.cycles, result.describe())
             return result

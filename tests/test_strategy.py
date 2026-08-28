@@ -334,7 +334,7 @@ def test_the_drift_warning_fires_once_per_market(system) -> None:
 # Activity rules: the holding cap and the idle timer
 # ==========================================================================
 
-def run_with_activity_rules(system, *, max_hold_ms=None, max_idle_bars=None,
+def run_with_activity_rules(system, *, max_hold_ms=None, max_idle_ms=None,
                             long_threshold=0.50, profile="conservative"):
     universe, matrices, generator = system
     generator.long_threshold = long_threshold
@@ -343,7 +343,7 @@ def run_with_activity_rules(system, *, max_hold_ms=None, max_idle_bars=None,
     risk = RiskEngine(limits, execution)
     strategy = ModelStrategy(
         generator, risk, matrices,
-        max_hold_ms=max_hold_ms, max_idle_bars=max_idle_bars,
+        max_hold_ms=max_hold_ms, max_idle_ms=max_idle_ms,
     )
     exchange = PaperExchange(
         limits.starting_capital, config=execution, simulator=FillSimulator(execution)
@@ -389,7 +389,7 @@ def test_the_idle_timer_forces_an_entry_the_model_did_not_ask_for(system) -> Non
     # A threshold this high means the model never asks to enter, so every
     # trade in the run exists only because the idle timer forced it.
     _, strategy = run_with_activity_rules(
-        system, max_idle_bars=4, long_threshold=0.999
+        system, max_idle_ms=4 * 3_600_000, long_threshold=0.999
     )
     forced = [d for d in strategy.decisions if d.action.startswith("forced long")]
     assert forced, "the idle timer never fired"
@@ -398,7 +398,7 @@ def test_the_idle_timer_forces_an_entry_the_model_did_not_ask_for(system) -> Non
 
 def test_without_an_idle_timer_a_silent_model_trades_nothing(system) -> None:
     result, strategy = run_with_activity_rules(
-        system, max_idle_bars=None, long_threshold=0.999
+        system, max_idle_ms=None, long_threshold=0.999
     )
     assert not [d for d in strategy.decisions if d.action.startswith("forced long")]
     assert result.trades == []
@@ -521,3 +521,38 @@ def test_an_existing_dust_position_can_still_be_closed(system) -> None:
     )
     assert len(orders) == 1, "a position too small to trade is a position you cannot leave"
     assert orders[0].reduce_only
+
+
+def test_the_idle_clock_survives_a_restart() -> None:
+    """A redeploy must not hand the timer a fresh zero.
+
+    The live service restarts on every deploy. With the clock counted in
+    memory it reset each time, so on a service that redeploys more often
+    than the idle limit the forced entry could never fire at all.
+    """
+    from unittest.mock import Mock
+
+    from models.predict import SignalGenerator
+
+    generator = Mock(spec=SignalGenerator)
+    generator.long_threshold = 0.55
+    generator.model = Mock(features=[])
+
+    started = 1_700_000_000_000
+    before = ModelStrategy(
+        generator, Mock(), {}, precompute=False,
+        max_idle_ms=6 * 3_600_000, idle_since_ms=started,
+    )
+    assert before.idle_ms(started + 5 * 3_600_000) == 5 * 3_600_000
+
+    # A restart builds a new strategy and hands it the persisted timestamp.
+    after = ModelStrategy(
+        generator, Mock(), {}, precompute=False,
+        max_idle_ms=6 * 3_600_000, idle_since_ms=before.idle_since_ms,
+    )
+    assert after.idle_ms(started + 5 * 3_600_000) == 5 * 3_600_000
+
+    # Without the handover the clock would start over.
+    naive = ModelStrategy(generator, Mock(), {}, precompute=False,
+                          max_idle_ms=6 * 3_600_000)
+    assert naive.idle_ms(started + 5 * 3_600_000) == 0

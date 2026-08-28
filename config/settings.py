@@ -364,25 +364,26 @@ class StrategyConfig:
     #: and re-entering is allowed, so a persistent signal survives.
     max_hold_hours: float = _env_float("MAX_HOLD_HOURS", 24.0)
 
-    #: After this many consecutive fully-flat bars, open the strongest
-    #: candidate regardless of the entry threshold. Buys activity, not
-    #: accuracy -- these are by construction the trades the model was not
-    #: confident enough to ask for. Set to 0 to leave the system idle.
-    max_idle_bars: int = _env_int("MAX_IDLE_BARS", 6)
+    #: After this many hours holding nothing, open the strongest candidate
+    #: regardless of the entry threshold. Buys activity, not accuracy --
+    #: these are by construction the trades the model was not confident
+    #: enough to ask for. Measured in wall-clock time rather than bars
+    #: counted in memory, so a restart cannot reset the clock. 0 disables.
+    max_idle_hours: float = _env_float("MAX_IDLE_HOURS", 6.0)
 
     @property
     def max_hold_ms(self) -> int | None:
         return int(self.max_hold_hours * 3_600_000) if self.max_hold_hours > 0 else None
 
     @property
-    def idle_bars(self) -> int | None:
-        return self.max_idle_bars if self.max_idle_bars > 0 else None
+    def max_idle_ms(self) -> int | None:
+        return int(self.max_idle_hours * 3_600_000) if self.max_idle_hours > 0 else None
 
     def describe(self) -> str:
         hold = (f"close after {self.max_hold_hours:g}h"
                 if self.max_hold_ms else "no holding cap")
-        idle = (f"force an entry after {self.max_idle_bars} flat bar(s)"
-                if self.idle_bars else "never force an entry")
+        idle = (f"force an entry after {self.max_idle_hours:g}h flat"
+                if self.max_idle_ms else "never force an entry")
         return f"{hold}; {idle}"
 
 

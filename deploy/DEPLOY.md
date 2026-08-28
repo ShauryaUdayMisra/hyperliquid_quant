@@ -266,6 +266,9 @@ your account to $100k and throws away the track record.
 | `TRADE_INTERVAL` | `1h` | Decision cadence. |
 | `BACKFILL_DAYS` | `400` | Hyperliquid serves ~5,000 candles, so 1h data caps near 208 days regardless. |
 | `SIGNAL_THRESHOLD` | `0.55` | P(up) a market must clear to open a long. |
+| `RISK_PROFILE` | `conservative` | `aggressive` removes the daily-loss and drawdown halts and raises leverage to 10x. Liquidation still applies and is the only backstop left. |
+| `MAX_HOLD_HOURS` | `24` | Force-close a position past this age. Re-entry allowed. 0 disables. |
+| `MAX_IDLE_HOURS` | `6` | Force an entry after this long holding nothing. 0 disables. |
 
 `SIGNAL_THRESHOLD` sets how often the system trades, not how well. The model's
 base rate is 0.33, so on 208 days of BTC/ETH/SOL history the default 0.55 fires

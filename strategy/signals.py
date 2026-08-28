@@ -66,7 +66,8 @@ class ModelStrategy(BaseStrategy):
         min_rebalance_fraction: float = 0.25,
         atr_column: str = "vol_atr_14",
         max_hold_ms: int | None = None,
-        max_idle_bars: int | None = None,
+        max_idle_ms: int | None = None,
+        idle_since_ms: int | None = None,
         precompute: bool = True,
     ) -> None:
         self.generator = generator
@@ -88,14 +89,18 @@ class ModelStrategy(BaseStrategy):
         #: being held on nothing -- the forecast it was opened on expired.
         #: None disables the cap.
         self.max_hold_ms = max_hold_ms
-        #: After this many consecutive fully-flat bars, take the strongest
-        #: candidate even though it did not clear the entry threshold. This
-        #: buys activity, not accuracy: the trades it forces are by
-        #: definition the ones the model was not confident enough to want.
-        self.max_idle_bars = max_idle_bars
-        self._idle_bars = 0
+        #: After this long holding nothing, take the strongest candidate
+        #: even though it did not clear the entry threshold. This buys
+        #: activity, not accuracy: the trades it forces are by definition
+        #: the ones the model was not confident enough to want.
+        self.max_idle_ms = max_idle_ms
+        #: When the current flat stretch began. Held as a timestamp rather
+        #: than a counter so a restarted live process can be handed the
+        #: real one; counting bars in memory silently reset the clock on
+        #: every redeploy, and the timer could never reach its limit.
+        self.idle_since_ms: int | None = idle_since_ms
         self._forced_coin: str | None = None
-        self._forced_after = 0
+        self._forced_for_ms = 0
         self.decisions: list[DecisionRecord] = []
         self._signal_cache: dict[str, list[Signal | None]] = {}
         self._warned_missing: set[str] = set()
@@ -204,14 +209,15 @@ class ModelStrategy(BaseStrategy):
         # Idle is measured on the account, not on the signals: holding a
         # position is not sitting still even when every probability is weak.
         flat = not any(c.currently_held for c in candidates)
-        self._idle_bars = self._idle_bars + 1 if flat else 0
+        if not flat:
+            self.idle_since_ms = None
+        elif self.idle_since_ms is None:
+            self.idle_since_ms = view.ts_ms
 
         self._forced_coin = None
-        forced = self._forced_entry(candidates) if flat else None
+        forced = self._forced_entry(candidates, view.ts_ms) if flat else None
         if forced is not None:
-            # Reset only after the reason has been captured for the log.
-            self._forced_after = self._idle_bars
-            self._idle_bars = 0
+            self.idle_since_ms = view.ts_ms
 
         selected, skipped = rank_candidates(candidates, self.risk.limits.max_open_positions)
         if forced is not None and forced not in selected:
@@ -374,25 +380,31 @@ class ModelStrategy(BaseStrategy):
 
     # -- forced activity ---------------------------------------------------
 
-    def _idle_limit_description(self) -> str:
-        return f"{self._forced_after} bar(s)"
+    def idle_ms(self, ts_ms: int) -> int:
+        """How long the account has been holding nothing."""
+        return 0 if self.idle_since_ms is None else max(0, ts_ms - self.idle_since_ms)
 
-    def _forced_entry(self, candidates: list[Candidate]) -> Candidate | None:
+    def _idle_limit_description(self) -> str:
+        return f"{self._forced_for_ms / 3_600_000:.1f}h"
+
+    def _forced_entry(self, candidates: list[Candidate], ts_ms: int) -> Candidate | None:
         """The candidate to open purely because nothing else has been opened.
 
         Only long: without a down-model a low P(up) means "do not buy", so
         forcing a short here would be inventing a signal that does not exist.
         """
-        if self.max_idle_bars is None or self._idle_bars < self.max_idle_bars:
+        idle = self.idle_ms(ts_ms)
+        if self.max_idle_ms is None or idle < self.max_idle_ms:
             return None
+        self._forced_for_ms = idle
         scored = [c for c in candidates if np.isfinite(c.signal.probability)]
         if not scored:
             return None
         best = max(scored, key=lambda c: c.signal.probability)
         self._forced_coin = best.signal.coin
         log.info(
-            "forcing an entry after %d flat bar(s): %s at P(up) %.3f",
-            self._idle_bars, best.signal.coin, best.signal.probability,
+            "forcing an entry after %.1fh flat: %s at P(up) %.3f",
+            idle / 3_600_000, best.signal.coin, best.signal.probability,
         )
         return best
 

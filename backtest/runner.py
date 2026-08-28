@@ -181,7 +181,7 @@ def run_backtest(
     strategy = ModelStrategy(
         generator, risk, matrices,
         max_hold_ms=settings.strategy.max_hold_ms,
-        max_idle_bars=settings.strategy.idle_bars,
+        max_idle_ms=settings.strategy.max_idle_ms,
     )
 
     exchange = PaperExchange(
