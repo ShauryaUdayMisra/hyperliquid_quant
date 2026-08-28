@@ -1,5 +1,10 @@
 # Single image for every phase of the system.
 #
+# Kept at the repository root deliberately: PaaS builders auto-detect a
+# root Dockerfile and prefer it over their own language heuristics. Buried
+# in deploy/ it was silently ignored, and Railway built a generic Python
+# app that ran none of the bootstrap.
+#
 # Python 3.12 rather than 3.14: LightGBM and scikit-learn ship prebuilt
 # wheels for 3.12, so the image builds in seconds instead of compiling from
 # source. The code targets 3.11+ and runs identically on both.

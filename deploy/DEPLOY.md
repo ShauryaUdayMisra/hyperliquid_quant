@@ -239,7 +239,7 @@ pushing if you want to be sure.
 On railway.app: **New Project → Deploy from GitHub repo** → pick the repo.
 
 Railway reads [`railway.json`](../railway.json), which points at
-`deploy/Dockerfile` and runs `deploy/start.sh`. No further build config.
+the root `Dockerfile` and runs `deploy/start.sh`. No further build config.
 
 ## 3. Add a volume — do this before the first successful deploy
 

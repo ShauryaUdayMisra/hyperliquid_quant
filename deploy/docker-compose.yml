@@ -6,7 +6,7 @@ services:
   collector:
     build:
       context: ..
-      dockerfile: deploy/Dockerfile
+      dockerfile: Dockerfile
     image: hlquant:latest
     container_name: hlquant-collector
     command: ["python", "main.py", "collect"]
