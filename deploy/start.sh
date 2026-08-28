@@ -14,6 +14,9 @@ BACKFILL_DAYS="${BACKFILL_DAYS:-400}"
 # Railway attaches ONE volume per service, so the model lives under the same
 # mount as the data. Otherwise every redeploy would retrain.
 MODEL_PATH="${MODEL_PATH:-storage/model.pkl}"
+# P(up) a market must clear before the strategy will open a long. Lower means
+# more trades on weaker evidence, not better ones -- see DEPLOY.md.
+THRESHOLD="${SIGNAL_THRESHOLD:-0.55}"
 
 echo "==> Hyperliquid paper trading (simulated fills only, no real orders)"
 python -c "from config.settings import SETTINGS; print('   ', SETTINGS.risk.describe())"
@@ -55,6 +58,7 @@ if [ "${HAVE_MODEL}" = "1" ]; then
     while true; do
       echo "==> starting paper trader"
       python main.py paper --interval "${INTERVAL}" --model "${MODEL_PATH}" \
+        --threshold "${THRESHOLD}" \
         || echo "!! paper trader exited ($?); restarting in 30s"
       sleep 30
     done

@@ -297,6 +297,8 @@ def cmd_paper(args: argparse.Namespace) -> int:
     print("PAPER TRADING - simulated fills against live Hyperliquid data.")
     print(f"  risk profile : {SETTINGS.risk.describe()}")
     print(f"  markets      : {', '.join(trader.coins)}")
+    print(f"  entry        : P(up) >= {args.threshold:.2f} "
+          f"(model base rate {trader.generator._base_rate:.2f}); long-only")
     print(f"  reports      : {'on' if SETTINGS.report.enabled else 'OFF'} "
           f"-> {SETTINGS.report.recipient} at {SETTINGS.report.schedule_hours}")
     if not service.emailer.configured:

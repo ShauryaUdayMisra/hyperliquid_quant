@@ -265,6 +265,15 @@ your account to $100k and throws away the track record.
 | `MARKETS` | `BTC,ETH,SOL` | Markets to trade. |
 | `TRADE_INTERVAL` | `1h` | Decision cadence. |
 | `BACKFILL_DAYS` | `400` | Hyperliquid serves ~5,000 candles, so 1h data caps near 208 days regardless. |
+| `SIGNAL_THRESHOLD` | `0.55` | P(up) a market must clear to open a long. |
+
+`SIGNAL_THRESHOLD` sets how often the system trades, not how well. The model's
+base rate is 0.33, so on 208 days of BTC/ETH/SOL history the default 0.55 fires
+on 6.9% of bars, 0.45 on 16.6%, and 0.40 on 24.9%. Lowering it buys frequency
+with weaker evidence, and every extra round trip pays spread, impact and fees.
+Given a holdout AUC of 0.504, expect a lower threshold to lose money faster
+rather than find an edge. There is no down-model, so the strategy is long-only:
+a low P(up) means "do not buy", never "sell short".
 
 For the 6-hour emails, add `REPORT_ENABLED=true`, `REPORT_RECIPIENT`,
 `REPORT_SENDER`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_APP_PASSWORD`.
