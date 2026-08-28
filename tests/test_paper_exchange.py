@@ -390,3 +390,35 @@ def test_one_unreachable_market_does_not_stop_the_others(monkeypatch) -> None:
     trader._refresh_market_data()
 
     assert refreshed == ["AAA", "CCC"], "a failing market stopped the ones after it"
+
+
+def test_a_market_with_no_stored_bars_is_skipped_not_fatal() -> None:
+    """One empty market must not stop the other twenty-four from trading.
+
+    Across a wide universe there is nearly always a coin mid-backfill or
+    newly listed. Raising on it aborted the whole cycle, so the account sat
+    flat while twenty-four markets had perfectly good data.
+    """
+    import pandas as pd
+
+    from execution.paper_trader import PaperTrader
+
+    bars = {
+        "AAA": pd.DataFrame({"ts_ms": [1], "close": [10.0]}),
+        "BBB": pd.DataFrame(columns=["ts_ms", "close"]),   # mid-backfill
+        "CCC": pd.DataFrame({"ts_ms": [1], "close": [20.0]}),
+    }
+    kept = PaperTrader._drop_empty_markets(bars)
+
+    assert set(kept) == {"AAA", "CCC"}
+    assert bars["BBB"].empty, "the caller's data was mutated"
+
+
+def test_every_market_empty_is_still_an_error() -> None:
+    """Skipping is for a straggler, not for having no data at all."""
+    import pandas as pd
+
+    from execution.paper_trader import PaperTrader
+
+    empty = {c: pd.DataFrame(columns=["ts_ms"]) for c in ("AAA", "BBB")}
+    assert PaperTrader._drop_empty_markets(empty) == {}

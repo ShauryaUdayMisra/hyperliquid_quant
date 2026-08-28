@@ -125,6 +125,13 @@ plants a deliberate leak to prove the checker works.
   first and outlasts `healthcheckTimeout` kills a container that is working.
   At `MARKETS=top:25` the cold-volume backfill does exactly that. `start.sh`
   now starts uvicorn in the background first and waits on it last.
+- **In a wide universe, one bad market must never stop the rest.** This has
+  now bitten three times in three places: an unhandled 429 in
+  `_refresh_market_data`, an empty frame in `run_cycle` ("a market has no
+  stored bars yet" aborted the whole cycle while 24 markets had good data),
+  and before that a missing feature column in `_signal_for`. The rule for
+  anything that loops over `self.coins`: degrade that market, log it, keep
+  going. Only refuse when *every* market is unusable.
 - **A wide universe will meet the rate limit; do not let it be fatal.** The
   live loop makes two requests per market per cycle. `_refresh_market_data`
   skips a market it cannot refresh and logs it, rather than raising: an

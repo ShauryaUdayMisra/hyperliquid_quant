@@ -294,6 +294,26 @@ class PaperTrader:
             )
         return snapshots
 
+    @staticmethod
+    def _drop_empty_markets(
+        bars: dict[str, pd.DataFrame]
+    ) -> dict[str, pd.DataFrame]:
+        """Markets that actually have bars to decide on.
+
+        A market with nothing stored is dropped for the cycle, not fatal.
+        Across a wide universe there is almost always one coin mid-backfill
+        or newly listed, and refusing to decide at all because of it stopped
+        the other twenty-four from trading -- the same "one bad market halts
+        everything" failure as an unhandled 429 in the refresh above.
+        """
+        empty = sorted(coin for coin, frame in bars.items() if frame.empty)
+        if empty:
+            log.warning(
+                "%d of %d market(s) have no stored bars yet, skipping them "
+                "this cycle: %s", len(empty), len(bars), ", ".join(empty),
+            )
+        return {coin: frame for coin, frame in bars.items() if not frame.empty}
+
     # -- the cycle ---------------------------------------------------------
 
     def run_cycle(self) -> CycleResult:
@@ -301,13 +321,31 @@ class PaperTrader:
         try:
             self._refresh_market_data()
             bars = self._load_bars()
-            if any(frame.empty for frame in bars.values()):
-                raise RuntimeError("a market has no stored bars yet")
 
+            # A market with nothing stored is dropped for this cycle, not
+            # fatal. Across a wide universe there is almost always one coin
+            # mid-backfill or newly listed, and refusing to decide at all
+            # because of it stopped the other twenty-four from trading --
+            # the same "one bad market halts everything" failure as an
+            # unhandled 429 in the refresh above.
+            bars = self._drop_empty_markets(bars)
+            if not bars:
+                raise RuntimeError(
+                    "no market has stored bars yet; run a backfill first"
+                )
+
+            # Funding and books follow the surviving bars: a coin dropped
+            # above must not reappear here with nothing to attach to.
             matrices = build_universe(
                 bars,
-                funding_by_coin=getattr(self, "_funding_frames", {}),
-                book_by_coin=getattr(self, "_book_frames", {}),
+                funding_by_coin={
+                    c: f for c, f in getattr(self, "_funding_frames", {}).items()
+                    if c in bars
+                },
+                book_by_coin={
+                    c: f for c, f in getattr(self, "_book_frames", {}).items()
+                    if c in bars
+                },
                 config=self.feature_config,
             )
             self.strategy.features = matrices
