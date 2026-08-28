@@ -110,6 +110,17 @@ plants a deliberate leak to prove the checker works.
 - **Funding timestamps are not exactly hourly** — they land at e.g.
   `06:00:00.019`. Gap and alignment checks need a jitter tolerance; a strict
   grid comparison reports thousands of gaps that do not exist.
+- **The web server must bind before any slow startup work.** The platform
+  starts its health check when the container starts, so a backfill that runs
+  first and outlasts `healthcheckTimeout` kills a container that is working.
+  At `MARKETS=top:25` the cold-volume backfill does exactly that. `start.sh`
+  now starts uvicorn in the background first and waits on it last.
+- **A wide universe will meet the rate limit; do not let it be fatal.** The
+  live loop makes two requests per market per cycle. `_refresh_market_data`
+  skips a market it cannot refresh and logs it, rather than raising: an
+  uncaught 429 exited the trader and the supervisor restarted it into the
+  same rate limit every 30 seconds. The strategy reads from storage, so a
+  skipped market decides on the bars it already has.
 - **Backfilling 1m/5m/1h at once triggers 429s.** Keep `CANDLE_INTERVALS=1h`
   in deployment.
 - **The cross-asset benchmark (BTC) has no `cross_*_btc_*` values.**

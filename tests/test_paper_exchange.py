@@ -357,3 +357,36 @@ def test_two_exchanges_do_not_share_state() -> None:
     buy(a, 10.0, snap(100.0))
     assert b.position("BTC").is_flat
     assert b.cash == 100_000.0
+
+
+# ==========================================================================
+# The live loop's tolerance for a flaky exchange
+# ==========================================================================
+
+def test_one_unreachable_market_does_not_stop_the_others(monkeypatch) -> None:
+    """A 429 on one coin must not take the whole cycle down.
+
+    Letting it propagate exited the trader, and the supervisor restarted it
+    straight back into the same rate limit every thirty seconds.
+    """
+    from execution.paper_trader import PaperTrader
+
+    trader = PaperTrader.__new__(PaperTrader)          # no network in __init__
+    trader.coins = ["AAA", "BBB", "CCC"]
+    trader.interval = "1h"
+
+    refreshed: list[str] = []
+
+    class FlakyDownloader:
+        def backfill_candles(self, coin, interval):
+            if coin == "BBB":
+                raise RuntimeError("HTTP 429: null")
+            refreshed.append(coin)
+
+        def backfill_funding(self, coin):
+            pass
+
+    trader.downloader = FlakyDownloader()
+    trader._refresh_market_data()
+
+    assert refreshed == ["AAA", "CCC"], "a failing market stopped the ones after it"

@@ -21,6 +21,19 @@ THRESHOLD="${SIGNAL_THRESHOLD:-0.55}"
 echo "==> Hyperliquid paper trading (simulated fills only, no real orders)"
 python -c "from config.settings import SETTINGS; print('   ', SETTINGS.risk.describe())"
 
+# 0. The web server goes up FIRST, before any slow work.
+#
+#    The platform starts its health check the moment the container starts and
+#    kills the deployment if nothing answers within healthcheckTimeout. The
+#    backfill below is unbounded -- it grows with the number of markets, and
+#    at MARKETS=top:25 it comfortably outlasts a 300s budget on a cold volume
+#    -- so binding the port after it made a working container look dead.
+#    Serving immediately also means a slow first backfill is something you
+#    can watch on the dashboard rather than guess at.
+echo "==> dashboard on :${PORT}"
+uvicorn dashboard.app:app --host 0.0.0.0 --port "${PORT}" --log-level warning &
+WEB_PID=$!
+
 # 1. Market data. Always run: the backfill resumes from whatever is already
 #    stored, so it is cheap when the volume is current and self-healing when
 #    a previous run was cut short by rate limiting. Skipping it merely
@@ -68,12 +81,20 @@ else
   echo "==> paper trader NOT started (no model)"
 fi
 
-# Stop the trader cleanly on SIGTERM so the last cycle's buffers reach the
+# Stop both children cleanly on SIGTERM so the last cycle's buffers reach the
 # volume instead of being dropped.
-trap 'echo "==> shutting down"; [ -n "${TRADER_PID}" ] && kill -TERM "${TRADER_PID}" 2>/dev/null; wait' TERM INT
+trap 'echo "==> shutting down";
+      [ -n "${TRADER_PID}" ] && kill -TERM "${TRADER_PID}" 2>/dev/null;
+      kill -TERM "${WEB_PID}" 2>/dev/null;
+      wait' TERM INT
 
-# 4. Dashboard in the foreground. It binds 0.0.0.0 because the platform's
-#    router reaches the container from outside; DASHBOARD_PASSWORD is what
-#    keeps it private, not the bind address.
-echo "==> dashboard on :${PORT}"
-exec uvicorn dashboard.app:app --host 0.0.0.0 --port "${PORT}" --log-level warning
+# 4. Wait on the web server. It was started first (see step 0) and it binds
+#    0.0.0.0 because the platform's router reaches the container from
+#    outside; DASHBOARD_PASSWORD is what keeps it private, not the bind
+#    address. If it dies the container should die with it, so its exit
+#    status becomes ours.
+wait "${WEB_PID}"
+STATUS=$?
+echo "!! dashboard exited (${STATUS})"
+[ -n "${TRADER_PID}" ] && kill -TERM "${TRADER_PID}" 2>/dev/null
+exit "${STATUS}"

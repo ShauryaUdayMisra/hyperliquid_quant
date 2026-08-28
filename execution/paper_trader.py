@@ -158,10 +158,34 @@ class PaperTrader:
     # -- data --------------------------------------------------------------
 
     def _refresh_market_data(self) -> None:
-        """Top up candles and funding from the exchange before deciding."""
+        """Top up candles and funding from the exchange before deciding.
+
+        A market that cannot be refreshed is skipped, not fatal. This loop
+        makes two requests per market, so a wide universe will eventually
+        meet a 429 or a 500 from the exchange; letting that propagate killed
+        the whole cycle, exited the trader, and left the supervisor
+        restarting it into the same rate limit every thirty seconds.
+
+        Skipping is safe because the strategy reads from storage, not from
+        this call: a market whose top-up failed simply decides on the bars
+        it already has, and the next cycle tries again. Silence is not
+        acceptable though -- a market that keeps failing is a market whose
+        data is going stale, so every failure is logged.
+        """
+        failed: list[str] = []
         for coin in self.coins:
-            self.downloader.backfill_candles(coin, self.interval)
-            self.downloader.backfill_funding(coin)
+            try:
+                self.downloader.backfill_candles(coin, self.interval)
+                self.downloader.backfill_funding(coin)
+            except Exception as exc:  # noqa: BLE001 - one market must not stop the rest
+                failed.append(coin)
+                log.warning("could not refresh %s, deciding on stored bars: %s",
+                            coin, exc)
+        if failed:
+            log.warning(
+                "%d of %d market(s) went un-refreshed this cycle: %s",
+                len(failed), len(self.coins), ", ".join(failed),
+            )
 
     def _load_bars(self) -> dict[str, pd.DataFrame]:
         with MarketDatabase(self.store) as db:
