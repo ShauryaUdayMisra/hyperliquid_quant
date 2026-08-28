@@ -297,6 +297,18 @@ def api_decisions(limit: int = 40) -> JSONResponse:
 
 # --------------------------------------------------------------------------
 
+@app.get("/health")
+def health() -> dict[str, str]:
+    """Unauthenticated liveness probe.
+
+    Deliberately outside require_auth: platform health checks cannot present
+    credentials, and pointing one at "/" means it reads the 401 as a failure
+    and kills a container that is working perfectly. Returns no account data,
+    so there is nothing here worth protecting.
+    """
+    return {"status": "ok"}
+
+
 @app.get("/", response_class=HTMLResponse, dependencies=[Depends(require_auth)])
 def index() -> str:
     return INDEX_HTML
