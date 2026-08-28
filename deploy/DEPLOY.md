@@ -317,3 +317,46 @@ Railway's TLS is adequate for a private paper account; it is not adequate for
 anything you would mind a determined stranger reading. The app hard-fails at
 startup if `RAILWAY_ENVIRONMENT` is set and `DASHBOARD_PASSWORD` is not, so a
 forgotten password takes the service down rather than quietly publishing it.
+
+---
+
+# The live deployment (recorded 2026-08-28)
+
+Live at **https://hyperliquidquant-production.up.railway.app**
+(HTTP Basic: `admin` / the value in `.railway_dashboard_password`, gitignored).
+
+Railway project `welcoming-rejoicing`, environment `production`, service
+`hyperliquid_quant`, US West. One service runs the trader and the dashboard
+together against a 5 GB volume at `/app/storage`.
+
+Administer it with the CLI rather than the web UI — it is already linked:
+
+```bash
+railway logs                      # runtime logs
+railway logs --build              # build logs
+railway variables                 # list; --set K=V --skip-deploys to change
+railway redeploy --yes            # apply changes
+railway volume list               # confirm the mount is attached
+```
+
+## Four things that broke on the first real deploy
+
+Recorded because each cost time and none was obvious from the error.
+
+1. **Railway ignored the Dockerfile in `deploy/`.** PaaS builders only
+   auto-detect a Dockerfile at the *repository root*. It fell back to its own
+   Python heuristics and built an image that ran none of the bootstrap. The
+   Dockerfile now lives at the root.
+2. **Railway ignored `railway.json`'s `startCommand`.** Config-as-code is
+   deprecated (sunset 2026-12-01), so the container fell through to the
+   image's `CMD` and ran the data collector instead of the system. The `CMD`
+   is now `bash deploy/start.sh`.
+3. **A volume mounts as root over the build-time `chown`.** The container ran
+   as an unprivileged user and could not write. `deploy/entrypoint.sh` now
+   starts as root purely to fix ownership, then drops to `quant` via `gosu`.
+4. **Rate limiting, then a poisoned bootstrap.** Backfilling 1m/5m/1h at once
+   drew HTTP 429s and left a partial candle store. The bootstrap saw the
+   directory, skipped the backfill, and training died with `no usable
+   labelled rows` — under `set -e` that crash-looped invisibly. The backfill
+   is idempotent and now always runs, a training failure no longer kills the
+   container, and `CANDLE_INTERVALS=1h` keeps request volume sane.
