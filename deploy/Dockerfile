@@ -7,7 +7,7 @@ FROM python:3.12-slim
 
 # libgomp1 is LightGBM's OpenMP runtime (needed from Phase 4 onward).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libgomp1 tini \
+    && apt-get install -y --no-install-recommends libgomp1 tini gosu \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -18,11 +18,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Never run the collector as root. The storage volume is chowned to match.
+# The process must not run as root. It cannot drop privileges before the
+# volume is mounted, though, so the entrypoint starts as root, fixes
+# ownership of the mounted paths, and then execs as `quant`.
 RUN useradd --create-home --uid 10001 quant \
-    && mkdir -p /app/storage /app/logs \
-    && chown -R quant:quant /app
-USER quant
+    && mkdir -p /app/storage /app/logs /app/models \
+    && chown -R quant:quant /app \
+    && chmod +x deploy/entrypoint.sh deploy/start.sh
 
 ENV PYTHONUNBUFFERED=1
 
@@ -30,10 +32,10 @@ ENV PYTHONUNBUFFERED=1
 ENV PORT=8000
 EXPOSE 8000
 
-# tini reaps zombies and forwards SIGTERM, so `docker stop` triggers the
-# collector's graceful shutdown and flushes buffered data instead of
-# dropping the last window.
-ENTRYPOINT ["tini", "--"]
+# tini reaps zombies and forwards SIGTERM, so `docker stop` triggers a
+# graceful shutdown and the last window's buffers reach disk. The entrypoint
+# then fixes volume ownership and drops root.
+ENTRYPOINT ["tini", "--", "/app/deploy/entrypoint.sh"]
 
 # Default: collector only. Railway overrides this with deploy/start.sh, which
 # runs the trader and the dashboard together against one shared volume.
