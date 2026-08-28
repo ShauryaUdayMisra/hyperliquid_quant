@@ -25,7 +25,7 @@ from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-from config.settings import SETTINGS
+from config.settings import INTERVAL_MS, SETTINGS
 from data.database import MarketDatabase, ParquetStore
 from execution.paper_exchange import PaperExchange
 from execution.simulator import FillSimulator
@@ -76,6 +76,20 @@ def require_auth(credentials: HTTPBasicCredentials | None = Depends(_security)) 
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _interval_ms() -> int:
+    return INTERVAL_MS.get(os.environ.get("TRADE_INTERVAL", "1h"), 3_600_000)
+
+
+def _next_decision_ms(after_ms: int) -> int:
+    """The next bar boundary the trader will wake on.
+
+    Mirrors PaperTrader._seconds_to_next_bar, including the 15s it waits
+    for the exchange to publish the closing bar.
+    """
+    interval = _interval_ms()
+    return ((after_ms // interval) + 1) * interval + 15_000
 
 
 HOUR_MS = 3_600_000
@@ -181,15 +195,23 @@ def api_state() -> JSONResponse:
     idle_since = extra.get("idle_since_ms")
     idle_ms = max(0, _now_ms() - int(idle_since)) if idle_since else None
     max_idle_ms = SETTINGS.strategy.max_idle_ms
+
+    # The moment the timer expires is not the moment anything happens: the
+    # trader only decides on bar boundaries. Report the decision that will
+    # act on it, or the number is off by up to a full interval -- which is
+    # exactly how a 13:00 entry got described as 12:21.
+    deadline = int(idle_since) + max_idle_ms if idle_since and max_idle_ms else None
     return JSONResponse({
         "activity": {
             "max_hold_hours": SETTINGS.strategy.max_hold_hours,
             "max_idle_hours": SETTINGS.strategy.max_idle_hours,
             "idle_since_ms": idle_since,
             "idle_hours": round(idle_ms / 3_600_000, 2) if idle_ms is not None else None,
-            "forced_entry_due_ms": (
-                int(idle_since) + max_idle_ms
-                if idle_since and max_idle_ms else None
+            "interval_ms": _interval_ms(),
+            "next_decision_ms": _next_decision_ms(_now_ms()),
+            "forced_entry_due_ms": deadline,
+            "forced_entry_at_ms": (
+                _next_decision_ms(deadline - 1) if deadline else None
             ),
         },
         "profile": SETTINGS.risk.name,
@@ -436,14 +458,20 @@ async function load(){
   // broken or simply waiting. Say which, and say when it acts next.
   const act = s.activity || {};
   const rules = [];
+  if (act.next_decision_ms) {
+    rules.push(`next decision ${new Date(act.next_decision_ms).toISOString().slice(11,16)} UTC`);
+  }
   if (act.max_hold_hours) rules.push(`closes any position after ${act.max_hold_hours}h`);
   if (act.max_idle_hours) {
     if (s.positions.length) {
       rules.push(`forces an entry after ${act.max_idle_hours}h holding nothing`);
     } else if (act.idle_hours != null) {
-      const left = Math.max(0, act.max_idle_hours - act.idle_hours);
-      rules.push(`flat for ${act.idle_hours.toFixed(1)}h — forces an entry in `
-                 + `${left.toFixed(1)}h if no signal clears first`);
+      const when = act.forced_entry_at_ms
+        ? new Date(act.forced_entry_at_ms).toISOString().slice(11,16) + ' UTC'
+        : null;
+      rules.push(`flat for ${act.idle_hours.toFixed(1)}h — forces an entry`
+                 + (when ? ` at the ${when} decision` : '')
+                 + ` unless a signal clears first`);
     }
   }
   document.getElementById('rules').textContent = rules.join(' · ');

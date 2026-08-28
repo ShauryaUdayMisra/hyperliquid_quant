@@ -72,3 +72,24 @@ def test_the_pages_javascript_parses() -> None:
         capture_output=True, text=True,
     )
     assert result.returncode == 0, f"page script does not parse:\n{result.stderr}"
+
+
+def test_the_forced_entry_is_reported_at_the_decision_that_acts_on_it() -> None:
+    """The timer expiring and the trader acting are different moments.
+
+    The trader only wakes on bar boundaries, so a timer that expires at
+    12:21 is acted on at the 13:00 decision. Reporting the expiry told the
+    user 12:21 and nothing happened then.
+    """
+    import dashboard.app as app_module
+
+    hour = 3_600_000
+    deadline = 12 * hour + 21 * 60_000        # 12:21 on an arbitrary day
+    acted_on = app_module._next_decision_ms(deadline - 1)
+
+    assert acted_on > deadline
+    assert acted_on == 13 * hour + 15_000     # the 13:00 decision, plus its wait
+
+    # A deadline that lands exactly on a boundary is served by that boundary.
+    on_the_hour = 13 * hour
+    assert app_module._next_decision_ms(on_the_hour - 1) == on_the_hour + 15_000
