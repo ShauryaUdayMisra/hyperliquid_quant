@@ -299,6 +299,7 @@ def cmd_paper(args: argparse.Namespace) -> int:
     print(f"  markets      : {', '.join(trader.coins)}")
     print(f"  entry        : P(up) >= {args.threshold:.2f} "
           f"(model base rate {trader.generator._base_rate:.2f}); long-only")
+    print(f"  activity     : {SETTINGS.strategy.describe()}")
     print(f"  reports      : {'on' if SETTINGS.report.enabled else 'OFF'} "
           f"-> {SETTINGS.report.recipient} at {SETTINGS.report.schedule_hours}")
     if not service.emailer.configured:
