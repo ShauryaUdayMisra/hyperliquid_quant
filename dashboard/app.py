@@ -434,15 +434,15 @@ async function load(){
 
   // An empty table should never leave you guessing whether the thing is
   // broken or simply waiting. Say which, and say when it acts next.
-  const a = s.activity || {};
+  const act = s.activity || {};
   const rules = [];
-  if (a.max_hold_hours) rules.push(`closes any position after ${a.max_hold_hours}h`);
-  if (a.max_idle_hours) {
+  if (act.max_hold_hours) rules.push(`closes any position after ${act.max_hold_hours}h`);
+  if (act.max_idle_hours) {
     if (s.positions.length) {
-      rules.push(`forces an entry after ${a.max_idle_hours}h holding nothing`);
-    } else if (a.idle_hours != null) {
-      const left = Math.max(0, a.max_idle_hours - a.idle_hours);
-      rules.push(`flat for ${a.idle_hours.toFixed(1)}h — forces an entry in `
+      rules.push(`forces an entry after ${act.max_idle_hours}h holding nothing`);
+    } else if (act.idle_hours != null) {
+      const left = Math.max(0, act.max_idle_hours - act.idle_hours);
+      rules.push(`flat for ${act.idle_hours.toFixed(1)}h — forces an entry in `
                  + `${left.toFixed(1)}h if no signal clears first`);
     }
   }

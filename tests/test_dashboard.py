@@ -44,3 +44,31 @@ def test_the_dashboard_itself_still_demands_a_password(client):
 def test_the_right_password_gets_in(client):
     http, _ = client
     assert http.get("/", auth=("admin", "s3cret")).status_code == 200
+
+
+def test_the_pages_javascript_parses() -> None:
+    """A syntax error in the page script blanks the entire dashboard.
+
+    Every value on the page is rendered by one script, so a single bad
+    token -- a redeclared variable, a stray brace -- leaves the user staring
+    at "loading..." with all six panels empty and every API returning 200.
+    That happened. Nothing else in the suite would have caught it.
+    """
+    import re
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed; cannot parse the page script")
+
+    import dashboard.app as app_module
+
+    scripts = re.findall(r"<script[^>]*>(.*?)</script>", app_module.INDEX_HTML, re.S)
+    assert scripts, "the page has no script to check"
+
+    result = subprocess.run(
+        [node, "--check", "-"], input="\n".join(scripts),
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, f"page script does not parse:\n{result.stderr}"

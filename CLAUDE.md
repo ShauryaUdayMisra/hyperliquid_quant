@@ -136,6 +136,12 @@ plants a deliberate leak to prove the checker works.
   its limit on a service that restarts often. It is now `idle_since_ms`,
   persisted in the state file's `extra` blob; position age likewise comes
   from `Position.opened_ts_ms`.
+- **One script renders the whole dashboard.** A single syntax error in it
+  blanks every panel while the page still returns 200 and all six APIs still
+  return 200 — the failure looks like a data problem and is not one. A
+  redeclared `const` did exactly this. `tests/test_dashboard.py` now runs
+  `node --check` over the page script; it skips where node is absent, so run
+  the suite locally before trusting a dashboard change.
 - **Never let label columns reach the feature list.** `label`,
   `forward_return` and `label_known` are excluded in two independent places.
   A missing exclusion once produced a perfect AUC 1.0000.
