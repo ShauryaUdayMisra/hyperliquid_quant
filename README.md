@@ -142,6 +142,13 @@ The live loop reuses the *same* `ModelStrategy` and `MarketView` as the
 backtest. Separate code paths would drift, and the backtest would stop being
 evidence about the live system.
 
+It trades both sides. Two models are trained: one asking P(rise > +0.30%),
+one asking P(fall > 0.30%). They are separate questions rather than
+complements — between them sits "goes nowhere", which is most bars — so a low
+P(up) means "do not buy", never "sell short". A short is taken only when the
+down-model clears its own threshold, and with no down-model present the system
+is long-only and says so.
+
 It also keeps learning. Every `RETRAIN_EVERY_HOURS` the trader refits on all
 stored history — including every bar it has since been wrong about — and swaps
 the new model in without a restart, keeping the incumbent if the candidate is
@@ -162,7 +169,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 .venv/bin/python main.py status            # API reachability + safety checks
 .venv/bin/python main.py prove-accounting  # verify the arithmetic
-.venv/bin/python -m pytest                 # 451 tests
+.venv/bin/python -m pytest                 # 460 tests
 
 .venv/bin/python main.py backfill --days 400 --intervals 1h
 .venv/bin/python main.py verify            # gaps + future timestamps

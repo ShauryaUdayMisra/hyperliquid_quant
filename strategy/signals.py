@@ -108,7 +108,8 @@ class ModelStrategy(BaseStrategy):
         #: real one; counting bars in memory silently reset the clock on
         #: every redeploy, and the timer could never reach its limit.
         self.idle_since_ms: int | None = idle_since_ms
-        self._forced_coins: set[str] = set()
+        #: coin -> forced direction, for the entries the idle rule opened.
+        self._forced_coins: dict[str, str] = {}
         self._forced_for_ms = 0
         self.decisions: list[DecisionRecord] = []
         self._signal_cache: dict[str, list[Signal | None]] = {}
@@ -238,7 +239,7 @@ class ModelStrategy(BaseStrategy):
         elif self.idle_since_ms is None:
             self.idle_since_ms = view.ts_ms
 
-        self._forced_coins = set()
+        self._forced_coins = {}
         forced = self._forced_entries(candidates, view.ts_ms, held=held) if flat else []
         if forced:
             self.idle_since_ms = view.ts_ms
@@ -340,10 +341,16 @@ class ModelStrategy(BaseStrategy):
             desired = np.sign(current_size)
             action = "hold"
         elif coin in self._forced_coins:
-            desired = 1.0
-            action = (f"forced long: {self._idle_limit_description()} flat, "
-                      f"strongest candidate at P(up) {signal.probability:.3f} "
-                      f"(below the {self.generator.long_threshold:.2f} entry bar)")
+            forced = self._forced_coins[coin]
+            desired = 1.0 if forced == "long" else -1.0
+            shown = (signal.probability if forced == "long"
+                     else (signal.down_probability or 0.0))
+            bar = (self.generator.long_threshold if forced == "long"
+                   else self.generator.short_threshold)
+            action = (f"forced {forced}: {self._idle_limit_description()} flat, "
+                      f"strongest candidate at "
+                      f"P({'up' if forced == 'long' else 'down'}) {shown:.3f} "
+                      f"(below the {bar:.2f} entry bar)")
         else:
             self.decisions.append(DecisionRecord(
                 view.ts_ms, coin, signal,
@@ -379,9 +386,20 @@ class ModelStrategy(BaseStrategy):
             is_new_position=abs(current_size) <= 1e-12,
         )
 
+        # A short is justified by the down-model, so quote that one. Reporting
+        # "short: P(return > +0.30%) = 0.271" describes the trade with the
+        # number that did not authorise it, which reads as a bug in the logs,
+        # the dashboard and the email alike.
+        shorting = desired < 0 and signal.down_probability is not None
+        shown_question = (
+            signal.down_label_question if shorting else signal.label_question
+        )
+        shown_probability = (
+            signal.down_probability if shorting else signal.probability
+        )
         context = DecisionContext(
-            reason=f"{action}: {signal.label_question} = {signal.probability:.3f}",
-            model_probability=signal.probability,
+            reason=f"{action}: {shown_question} = {shown_probability:.3f}",
+            model_probability=shown_probability,
             model_confidence=signal.confidence,
             regime=signal.regime,
             features={f.name: f.contribution for f in signal.top_features},
@@ -431,11 +449,19 @@ class ModelStrategy(BaseStrategy):
         Every free position slot is filled, not just one. Opening a single
         name and then waiting concentrates the whole account in whichever
         coin happened to rank first, which is the opposite of what a
-        multi-market system is for -- and with no down-model it cannot even
-        hedge that concentration.
+        multi-market system is for.
 
-        Only long: without a down-model a low P(up) means "do not buy", so
-        forcing a short here would be inventing a signal that does not exist.
+        Direction is chosen per market, not fixed. With a down-model the
+        forced trade goes whichever way the models actually lean: in a
+        falling market every forced long is a trade taken against the
+        evidence, and forcing twenty of them at once was the worst thing
+        this rule could do. Without a down-model it stays long-only, because
+        a low P(up) means "do not buy" and never "sell short" -- forcing a
+        short on that would be inventing a signal that does not exist.
+
+        These are still, by construction, the trades the model was not
+        confident enough to ask for. Choosing the better of two weak
+        directions makes them less bad, not good.
         """
         idle = self.idle_ms(ts_ms)
         if self.max_idle_ms is None or idle < self.max_idle_ms:
@@ -451,16 +477,48 @@ class ModelStrategy(BaseStrategy):
         ]
         if not scored:
             return []
-        scored.sort(key=lambda c: c.signal.probability, reverse=True)
-        chosen = scored[:slots]
-        self._forced_coins = {c.signal.coin for c in chosen}
+
+        # Rank on the strength of the better side, so a market the models
+        # feel strongly about wins its slot whichever way it leans.
+        ranked = sorted(
+            ((c, *self._forced_direction(c.signal)) for c in scored),
+            key=lambda item: item[2], reverse=True,
+        )[:slots]
+
+        chosen = [c for c, _direction, _strength in ranked]
+        self._forced_coins = {c.signal.coin: d for c, d, _ in ranked}
         log.info(
             "forcing %d entry/entries after %.1fh flat: %s",
             len(chosen), idle / 3_600_000,
-            ", ".join(f"{c.signal.coin} P(up) {c.signal.probability:.3f}"
-                      for c in chosen),
+            ", ".join(
+                f"{c.signal.coin} {d} "
+                f"(P(up) {c.signal.probability:.3f}"
+                + (f", P(down) {c.signal.down_probability:.3f}"
+                   if c.signal.down_probability is not None else "")
+                + ")"
+                for c, d, _ in ranked
+            ),
         )
         return chosen
+
+    def _forced_direction(self, signal: Signal) -> tuple[str, float]:
+        """Which way to force this market, and how strongly it leans.
+
+        Strength is distance from each model's own base rate, so the two
+        sides are comparable. Without a down-model there is only one side to
+        pick from.
+        """
+        up_edge = signal.probability - signal.base_rate
+        if signal.down_probability is None:
+            return "long", float(up_edge)
+
+        down_base = (
+            signal.base_rate if signal.down_base_rate is None else signal.down_base_rate
+        )
+        down_edge = signal.down_probability - down_base
+        if down_edge > up_edge:
+            return "short", float(down_edge)
+        return "long", float(up_edge)
 
     # -- reporting ---------------------------------------------------------
 

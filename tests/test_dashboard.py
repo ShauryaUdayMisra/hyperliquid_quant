@@ -153,10 +153,13 @@ def test_the_learning_panel_says_which_model_is_deciding(client):
     http, _ = client
     body = http.get("/api/learning", auth=("admin", "s3cret")).json()
 
-    assert set(body) == {"model", "retrain", "scorecard"}
+    assert set(body) == {"model", "retrain", "scorecard", "shorting"}
     assert "enabled" in body["retrain"]
     assert "describe" in body["retrain"]
     assert "resolved" in body["scorecard"]
+    # Whether it can act on a falling market at all is not something a reader
+    # should have to infer from an absence of short fills.
+    assert "enabled" in body["shorting"]
 
 
 def test_the_learning_endpoint_is_behind_the_password(client):

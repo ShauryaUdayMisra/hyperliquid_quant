@@ -471,13 +471,16 @@ def api_learning() -> JSONResponse:
     shift in behaviour is otherwise indistinguishable from a shift in the
     market.
     """
-    model = None
+    model = down_model = None
     try:
-        from models.train import TrainedModel
+        from models.train import TrainedModel, down_model_path
 
         path = _model_path()
         if path.exists():
             model = TrainedModel.load(path)
+        down_path = down_model_path(path)
+        if down_path.exists():
+            down_model = TrainedModel.load(down_path)
     except Exception as exc:  # noqa: BLE001
         log.warning("could not read the live model: %s", exc)
 
@@ -498,6 +501,15 @@ def api_learning() -> JSONResponse:
             "trained_through_ms": model.train_span[1],
             "val_auc": _finite(model.mean_val_auc),
             "log_loss_lift": _finite(model.mean_log_loss_lift),
+        },
+        # Whether the system can act on a falling market at all, or can only
+        # sit one out. That is not something a reader should have to infer
+        # from an absence of short fills.
+        "shorting": {
+            "enabled": down_model is not None,
+            "question": None if down_model is None else down_model.label_config.name,
+            "val_auc": None if down_model is None else _finite(down_model.mean_val_auc),
+            "trained_through_ms": None if down_model is None else down_model.train_span[1],
         },
         "retrain": {
             "enabled": every_ms is not None,
@@ -646,6 +658,7 @@ function statCard(label,value,sub){
 
 function renderLearning(l){
   const m=l.model, rt=l.retrain||{}, sc=l.scorecard||{}, mx=sc.metrics||{};
+  const sh=l.shorting||{};
   const bits=[];
   if(m){
     bits.push(`${m.backend} · ${m.features} features · asks ${m.question}`);
@@ -654,6 +667,10 @@ function renderLearning(l){
   } else {
     bits.push('No model artefact could be read.');
   }
+  bits.push(sh.enabled
+    ? `shorting ON — ${sh.question}`
+      + (sh.val_auc!=null?` (AUC ${sh.val_auc.toFixed(4)})`:'')
+    : 'shorting OFF — long-only, it can only sit out a falling market');
   if(rt.enabled && rt.next_ms) bits.push(`next refit ${tm(rt.next_ms)} ${tzLabel()}`);
   else if(!rt.enabled) bits.push('retraining is OFF — this model is frozen');
   document.getElementById('lsub').textContent = bits.join(' · ');

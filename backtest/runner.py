@@ -154,12 +154,14 @@ def run_backtest(
     bars_by_coin: dict[str, pd.DataFrame],
     model: TrainedModel,
     *,
+    down_model: TrainedModel | None = None,
     funding_by_coin: dict[str, pd.DataFrame] | None = None,
     book_by_coin: dict[str, pd.DataFrame] | None = None,
     settings: Settings | None = None,
     limits: RiskLimits | None = None,
     interval: str = "1h",
     long_threshold: float = 0.55,
+    short_threshold: float | None = None,
     warmup_bars: int = 800,
     out_of_sample_from_ms: int | None = None,
     asset_max_leverage: dict[str, float] | None = None,
@@ -176,7 +178,14 @@ def run_backtest(
         config=FeatureConfig(interval=interval),
     )
 
-    generator = SignalGenerator(model, long_threshold=long_threshold)
+    # Without a down-model this is long-only, exactly as before: a low
+    # P(up) means "do not buy", never "sell short".
+    generator = SignalGenerator(
+        model,
+        down_model=down_model,
+        long_threshold=long_threshold,
+        short_threshold=long_threshold if short_threshold is None else short_threshold,
+    )
     risk = RiskEngine(limits, settings.execution)
     strategy = ModelStrategy(
         generator, risk, matrices,
@@ -268,12 +277,21 @@ def run_shuffled_control(
     demonstrated an edge, whatever its Sharpe ratio says.
     """
     rng = np.random.default_rng(seed)
-    original = model.backend.predict_proba
 
-    def shuffled(X):
-        return rng.permutation(original(X))
+    # Both sides, when both are in play. Shuffling only the long model would
+    # leave the short model's real predictions intact, and a control that
+    # keeps half the signal is not a control -- it is a second strategy.
+    shuffle_targets = [model]
+    down_model = kwargs.get("down_model")
+    if down_model is not None:
+        shuffle_targets.append(down_model)
 
-    model.backend.predict_proba = shuffled
+    originals = [m.backend.predict_proba for m in shuffle_targets]
+    for target, original in zip(shuffle_targets, originals):
+        def shuffled(X, _original=original):
+            return rng.permutation(_original(X))
+        target.backend.predict_proba = shuffled
+
     try:
         report = run_backtest(bars_by_coin, model, **kwargs)
     finally:
@@ -281,12 +299,15 @@ def run_shuffled_control(
         # would poison every later result in the process. Deleting the
         # instance attribute (rather than reassigning it) puts the object
         # back exactly as it was, with the class method unshadowed.
-        del model.backend.predict_proba
+        for target in shuffle_targets:
+            del target.backend.predict_proba
 
     report.strategy_name = "shuffled control"
     report.notes.append(
-        "Predictions were randomly permuted. Treat this as the floor the real "
-        "strategy must clear to have shown any edge."
+        f"Predictions were randomly permuted ({len(shuffle_targets)} model(s): "
+        f"{'long and short' if len(shuffle_targets) > 1 else 'long only'}). "
+        "Treat this as the floor the real strategy must clear to have shown "
+        "any edge."
     )
     return report
 

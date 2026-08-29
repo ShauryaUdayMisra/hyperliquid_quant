@@ -17,6 +17,9 @@ MODEL_PATH="${MODEL_PATH:-storage/model.pkl}"
 # P(up) a market must clear before the strategy will open a long. Lower means
 # more trades on weaker evidence, not better ones -- see DEPLOY.md.
 THRESHOLD="${SIGNAL_THRESHOLD:-0.55}"
+# P(down) a market must clear before the strategy will open a short. Defaults
+# to the long bar, so the two sides are held to the same standard.
+SHORT_THRESHOLD="${SHORT_THRESHOLD:-${THRESHOLD}}"
 
 echo "==> Hyperliquid paper trading (simulated fills only, no real orders)"
 python -c "from config.settings import SETTINGS; print('   ', SETTINGS.risk.describe())"
@@ -49,12 +52,30 @@ python main.py summary 2>/dev/null | sed 's/^/    /' || true
 # 2. Model. Never fabricate one; if training cannot succeed, say so loudly
 #    and still bring the dashboard up so the failure is visible rather than
 #    hidden behind a restart loop.
+# The short-side model is a sibling file, so the pair lives on one volume.
+DOWN_MODEL_PATH="${MODEL_PATH%.pkl}_down.pkl"
+
 HAVE_MODEL=0
 if [ -f "${MODEL_PATH}" ]; then
   echo "==> Using existing ${MODEL_PATH}"
   HAVE_MODEL=1
+
+  # A volume from before shorting existed has the long model and nothing
+  # else. Without this it would never get one: the branch above skips
+  # training entirely whenever the long model is present, so the system
+  # would stay long-only forever and silently sit out every falling market.
+  if [ ! -f "${DOWN_MODEL_PATH}" ]; then
+    echo "==> No short-side model at ${DOWN_MODEL_PATH}. Training one..."
+    python main.py train --interval "${INTERVAL}" --direction down \
+      --output "${MODEL_PATH}" \
+      || echo "!! short-side training failed; continuing LONG-ONLY"
+  else
+    echo "==> Using existing ${DOWN_MODEL_PATH}"
+  fi
 else
-  echo "==> No model at ${MODEL_PATH}. Training with walk-forward validation..."
+  echo "==> No model at ${MODEL_PATH}. Training both sides with walk-forward"
+  echo "    validation. Long-only until the long model exists; shorting needs"
+  echo "    the short model as well."
   if python main.py train --interval "${INTERVAL}" --output "${MODEL_PATH}"; then
     HAVE_MODEL=1
   else
@@ -72,6 +93,7 @@ if [ "${HAVE_MODEL}" = "1" ]; then
       echo "==> starting paper trader"
       python main.py paper --interval "${INTERVAL}" --model "${MODEL_PATH}" \
         --threshold "${THRESHOLD}" \
+        --short-threshold "${SHORT_THRESHOLD:-${THRESHOLD}}" \
         || echo "!! paper trader exited ($?); restarting in 30s"
       sleep 30
     done

@@ -61,6 +61,11 @@ class RetrainOutcome:
     ts_ms: int
     status: str          # "promoted" | "rejected" | "skipped" | "failed"
     reason: str
+    #: Which question this model answers -- "up" (longs) or "down" (shorts).
+    #: Both sides refit in the same pass, so the history needs to tell them
+    #: apart; without it two outcomes share a timestamp and one is lost to
+    #: the upsert key.
+    side: str = "up"
     rows: int = 0
     new_rows: int = 0
     span: tuple[int, int] | None = None
@@ -77,7 +82,7 @@ class RetrainOutcome:
         return self.status == "promoted"
 
     def describe(self) -> str:
-        head = f"retrain {self.status}: {self.reason}"
+        head = f"retrain [{self.side}] {self.status}: {self.reason}"
         if self.status in {"skipped", "failed"}:
             return head
         return (
@@ -90,6 +95,7 @@ class RetrainOutcome:
         """One row for the ``retrains`` history table."""
         return {
             "ts_ms": self.ts_ms,
+            "side": self.side,
             "status": self.status,
             "reason": self.reason,
             "rows": self.rows,
@@ -218,6 +224,105 @@ def new_bar_count(
     return int(frame["bars"].iloc[0]) if not frame.empty else 0
 
 
+def build_features(
+    coins: list[str], interval: str, *, store: Any | None = None
+) -> dict[str, pd.DataFrame]:
+    """Point-in-time features for every tradable market, from storage."""
+    from data.loader import load_bars, load_funding, load_order_books
+    from features.pipeline import FeatureConfig, align_bars, build_universe
+
+    bars = align_bars(load_bars(coins, interval, store=store))
+    return build_universe(
+        bars,
+        funding_by_coin=load_funding(list(bars), store=store),
+        book_by_coin=load_order_books(list(bars), store=store),
+        config=FeatureConfig(interval=interval),
+    )
+
+
+def retrain_pair(
+    *,
+    coins: list[str],
+    interval: str,
+    model_path: Path | str,
+    incumbent: TrainedModel | None,
+    down_incumbent: TrainedModel | None = None,
+    settings: Settings | None = None,
+    learning: LearningConfig | None = None,
+    force: bool = False,
+    dry_run: bool = False,
+    store: Any | None = None,
+) -> list[RetrainOutcome]:
+    """Refit both sides of the book in one pass. Never raises.
+
+    The long and short models answer different questions about the same
+    feature matrix, so the matrix is built once and labelled twice. Each
+    side is then promoted on its own merit: a good new long model is not
+    held back because the short model came out worse, and vice versa. They
+    were never a matched set -- they are two independent opinions.
+    """
+    from models.train import down_model_path
+
+    settings = settings or SETTINGS
+    learning = learning or settings.learning
+    now_ms = int(time.time() * 1000)
+
+    sides: list[tuple[str, Path, TrainedModel | None]] = [
+        ("up", Path(model_path), incumbent),
+        ("down", down_model_path(model_path), down_incumbent),
+    ]
+    # A side with no incumbent and no way to build one is simply absent --
+    # a long-only deployment must not start reporting a failed short retrain
+    # every day.
+    sides = [s for s in sides if s[0] == "up" or s[2] is not None]
+
+    # Build once, but only if at least one side has something new to learn.
+    matrices: dict[str, pd.DataFrame] | None = None
+    outcomes: list[RetrainOutcome] = []
+    for side, path, model in sides:
+        if matrices is None and not (force or _has_new_data(
+            coins, interval, model, learning, store=store
+        )):
+            outcomes.append(RetrainOutcome(
+                ts_ms=now_ms, side=side, status="skipped",
+                reason=(
+                    "no new bars since this model was fitted; refitting would "
+                    "just reseed it"
+                ),
+            ))
+            continue
+        if matrices is None:
+            try:
+                matrices = build_features(coins, interval, store=store)
+            except Exception as exc:  # noqa: BLE001 - never stop the trader
+                log.exception("could not build features for the retrain")
+                return outcomes + [RetrainOutcome(
+                    ts_ms=now_ms, side=side, status="failed",
+                    reason=f"{type(exc).__name__}: {exc}",
+                )]
+        outcomes.append(retrain(
+            coins=coins, interval=interval, model_path=path, incumbent=model,
+            settings=settings, learning=learning, force=force, dry_run=dry_run,
+            store=store, matrices=matrices, side=side,
+        ))
+    return outcomes
+
+
+def _has_new_data(
+    coins: list[str],
+    interval: str,
+    incumbent: TrainedModel | None,
+    learning: LearningConfig,
+    *,
+    store: Any | None = None,
+) -> bool:
+    if incumbent is None:
+        return True
+    return new_bar_count(
+        coins, interval, incumbent.trained_at_ms, store=store
+    ) >= learning.min_new_bars
+
+
 def retrain(
     *,
     coins: list[str],
@@ -229,6 +334,8 @@ def retrain(
     force: bool = False,
     dry_run: bool = False,
     store: Any | None = None,
+    matrices: dict[str, pd.DataFrame] | None = None,
+    side: str = "up",
 ) -> RetrainOutcome:
     """Refit on all stored history and promote the result if it earns it.
 
@@ -237,8 +344,6 @@ def retrain(
     through the supervisor, restart the process into the same failure.
     """
     from data.database import ParquetStore
-    from data.loader import load_bars, load_funding, load_order_books
-    from features.pipeline import FeatureConfig, align_bars, build_universe
     from models.backend import ModelParams
     from models.dataset import SplitConfig, assemble
     from models.labels import LabelConfig
@@ -261,6 +366,7 @@ def retrain(
             if new_bars < learning.min_new_bars:
                 return RetrainOutcome(
                     ts_ms=now_ms,
+                    side=side,
                     status="skipped",
                     reason=(
                         f"only {new_bars} new bar(s) since the model was fitted; "
@@ -270,13 +376,11 @@ def retrain(
                     elapsed_s=time.time() - started,
                 )
 
-        bars = align_bars(load_bars(coins, interval, store=store))
-        matrices = build_universe(
-            bars,
-            funding_by_coin=load_funding(list(bars), store=store),
-            book_by_coin=load_order_books(list(bars), store=store),
-            config=FeatureConfig(interval=interval),
-        )
+        # The caller may hand these in. Both sides of the book train on the
+        # identical feature matrix and differ only in the question asked, so
+        # rebuilding it per side would double the expensive half of the work.
+        if matrices is None:
+            matrices = build_features(coins, interval, store=store)
         label_config = incumbent.label_config if incumbent else LabelConfig()
         params = incumbent.params if incumbent else ModelParams()
         # Keep the backend stable across a retrain unless it is unavailable.
@@ -306,6 +410,7 @@ def retrain(
         )
         outcome = RetrainOutcome(
             ts_ms=now_ms,
+            side=side,
             status="promoted" if promote else "rejected",
             reason=reason,
             rows=int(len(dataset)),
@@ -335,6 +440,7 @@ def retrain(
         log.exception("retrain failed; continuing on the existing model")
         return RetrainOutcome(
             ts_ms=now_ms,
+            side=side,
             status="failed",
             reason=f"{type(exc).__name__}: {exc}",
             elapsed_s=time.time() - started,

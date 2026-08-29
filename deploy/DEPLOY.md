@@ -270,6 +270,7 @@ your account to $100k and throws away the track record.
 | `TRADE_INTERVAL` | `1h` | Decision cadence. |
 | `BACKFILL_DAYS` | `400` | Hyperliquid serves ~5,000 candles, so 1h data caps near 208 days regardless. |
 | `SIGNAL_THRESHOLD` | `0.55` | P(up) a market must clear to open a long. |
+| `SHORT_THRESHOLD` | same as `SIGNAL_THRESHOLD` | P(down) a market must clear to open a short. Passed as `--short-threshold`; shorting needs `model_down.pkl` beside `model.pkl`. |
 | `RISK_PROFILE` | `conservative` | `aggressive` removes the daily-loss and drawdown halts and raises leverage to 10x. Liquidation still applies and is the only backstop left. |
 | `MAX_HOLD_HOURS` | `24` | Force-close a position past this age. Re-entry allowed. 0 disables. |
 | `MAX_IDLE_HOURS` | `6` | Force an entry after this long holding nothing. 0 disables. |
@@ -283,8 +284,25 @@ base rate is 0.33, so on 208 days of BTC/ETH/SOL history the default 0.55 fires
 on 6.9% of bars, 0.45 on 16.6%, and 0.40 on 24.9%. Lowering it buys frequency
 with weaker evidence, and every extra round trip pays spread, impact and fees.
 Given a holdout AUC of 0.504, expect a lower threshold to lose money faster
-rather than find an edge. There is no down-model, so the strategy is long-only:
-a low P(up) means "do not buy", never "sell short".
+rather than find an edge.
+
+The system trains **two** models: `model.pkl` asks P(rise > +0.30%) and
+`model_down.pkl` asks P(fall > 0.30%). They are separate questions, not
+complements -- between them sits "goes nowhere", which is most bars -- so a
+low P(up) still means "do not buy" and never "sell short". A short is taken
+only when the down-model clears `SHORT_THRESHOLD` on its own. If
+`model_down.pkl` is missing the system is long-only and says so on the
+dashboard, in the logs and in the 6-hour email; `start.sh` will train one on
+the next boot, including on a volume that predates shorting.
+
+Shorting did not make the aggressive profile profitable. Measured on 3
+markets at a 0.40 threshold: long-only wiped out in 49 days over 70 trades
+(17.1% win rate), long+short survived the full 209 days but still finished
+at **$0.74** over 674 trades (44.2% win rate, profit factor 0.49). The win
+rate more than doubled and the account still went to zero, because the
+binding constraint is turnover against costs -- annualised turnover went
+from 1,152x to 2,604x and slippage from $111k to $292k -- not the inability
+to trade the short side.
 
 For the 6-hour emails, add `REPORT_ENABLED=true`, `REPORT_RECIPIENT`,
 `REPORT_SENDER`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_APP_PASSWORD`.

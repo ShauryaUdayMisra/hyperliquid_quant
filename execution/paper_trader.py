@@ -52,9 +52,9 @@ from execution.simulator import FillSimulator, MarketSnapshot
 from execution.state_store import StateStore
 from features.pipeline import FeatureConfig, align_bars, build_universe
 from models.predict import SignalGenerator
-from models.retrain import RetrainOutcome, record as record_retrain, retrain
+from models.retrain import RetrainOutcome, record as record_retrain, retrain_pair
 from models.scorecard import LiveScorecard, load_scorecard
-from models.train import TrainedModel
+from models.train import TrainedModel, down_model_path
 from risk.risk_engine import RiskEngine
 from strategy.signals import ModelStrategy
 
@@ -92,6 +92,7 @@ class PaperTrader:
         model_path: Path | str | None = None,
         interval: str = "1h",
         long_threshold: float = 0.55,
+        short_threshold: float | None = None,
         client: HyperliquidInfoClient | None = None,
         store: ParquetStore | None = None,
         exchange: PaperExchange | None = None,
@@ -130,7 +131,30 @@ class PaperTrader:
         self.model_path = model_path
         self.model: TrainedModel = TrainedModel.load(model_path)
         self.long_threshold = long_threshold
-        self.generator = SignalGenerator(self.model, long_threshold=long_threshold)
+        self.short_threshold = (
+            long_threshold if short_threshold is None else short_threshold
+        )
+
+        # The short side is optional and absent by default. Without it a low
+        # P(up) means "do not buy", never "sell short" -- the two are not
+        # complements, because between them sits "goes nowhere", which is
+        # most bars. A short is only ever taken on a model trained to answer
+        # that question.
+        self.down_model_path = down_model_path(model_path)
+        self.down_model: TrainedModel | None = None
+        if self.down_model_path.exists():
+            self.down_model = TrainedModel.load(self.down_model_path)
+            log.info(
+                "shorting enabled: %s, asking %s",
+                self.down_model_path.name, self.down_model.label_config.name,
+            )
+        else:
+            log.warning(
+                "no down-model at %s: the system is long-only and can only sit "
+                "out a falling market. Run `python main.py train` to build one.",
+                self.down_model_path,
+            )
+        self.generator = self._build_generator()
 
         self.risk = RiskEngine(self.settings.risk, self.settings.execution)
         self.exchange = exchange or PaperExchange(
@@ -169,6 +193,15 @@ class PaperTrader:
         self._stop = asyncio.Event()
         self.cycles = 0
         self.errors = 0
+
+    def _build_generator(self) -> SignalGenerator:
+        """The live generator, from whichever models are currently loaded."""
+        return SignalGenerator(
+            self.model,
+            down_model=self.down_model,
+            long_threshold=self.long_threshold,
+            short_threshold=self.short_threshold,
+        )
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -468,7 +501,7 @@ class PaperTrader:
             store=self.store,
         )
 
-    def _maybe_retrain(self, now_ms: int) -> RetrainOutcome | None:
+    def _maybe_retrain(self, now_ms: int) -> list[RetrainOutcome] | None:
         """Refit on everything stored, if the model is due. Never raises.
 
         Run inline rather than on a worker thread. The cycle writes candles
@@ -485,54 +518,61 @@ class PaperTrader:
             card = self.scorecard()
             log.info("before retraining -- %s", card.describe())
 
-            outcome = retrain(
+            # Both sides of the book, from one feature build. Each is
+            # promoted on its own merit: a better long model is not held
+            # back because the short model came out worse.
+            outcomes = retrain_pair(
                 coins=self.coins,
                 interval=self.interval,
                 model_path=self.model_path,
                 incumbent=self.model,
+                down_incumbent=self.down_model,
                 settings=self.settings,
                 learning=self.learning,
                 store=self.store,
             )
-            record_retrain(outcome, store=self.store)
-            self.last_retrain = outcome
-            log.info("%s", outcome.describe())
-
-            if outcome.promoted and outcome.model is not None:
-                self._swap_model(outcome.model)
+            for outcome in outcomes:
+                record_retrain(outcome, store=self.store)
+                log.info("%s", outcome.describe())
+                if outcome.promoted and outcome.model is not None:
+                    self._swap_model(outcome.model, side=outcome.side)
+            self.last_retrain = outcomes[0] if outcomes else None
 
             # The clock advances on any *completed* attempt, including a
             # rejection. A candidate that lost to the incumbent would lose
             # again on the same data an hour later; retrying every cycle
             # would burn the box for nothing. A "skipped" attempt -- too
             # little new data -- is cheap and is retried next cycle.
-            if outcome.status != "skipped":
+            if any(o.status != "skipped" for o in outcomes):
                 self._last_retrain_ms = now_ms
                 self.state_store.save(self.exchange, extra=self._state_extra())
-            return outcome
+            return outcomes
         except Exception as exc:  # noqa: BLE001 - learning must not stop trading
             log.exception("retrain step failed; trading continues on the current model")
             self._last_retrain_ms = now_ms
-            return RetrainOutcome(
+            return [RetrainOutcome(
                 ts_ms=now_ms, status="failed", reason=f"{type(exc).__name__}: {exc}"
-            )
+            )]
 
-    def _swap_model(self, model: TrainedModel) -> None:
+    def _swap_model(self, model: TrainedModel, *, side: str = "up") -> None:
         """Put a newly trained model behind the live strategy, in place.
 
         The strategy holds the generator, so replacing only ``self.model``
         would leave every decision still being made by the old one. The
-        entry threshold is carried across unchanged: retraining changes what
-        the model has seen, never how confident it must be to trade.
+        entry thresholds are carried across unchanged: retraining changes
+        what a model has seen, never how confident it must be to trade.
         """
-        self.model = model
-        self.generator = SignalGenerator(model, long_threshold=self.long_threshold)
+        if side == "down":
+            self.down_model = model
+        else:
+            self.model = model
+        self.generator = self._build_generator()
         self.strategy.generator = self.generator
         self.strategy._signal_cache = {}
         log.info(
-            "live model replaced: %s, %d features, trained through %s, "
+            "live %s-model replaced: %s, %d features, trained through %s, "
             "walk-forward AUC %.4f",
-            model.backend_name, len(model.features),
+            side, model.backend_name, len(model.features),
             pd.Timestamp(model.train_span[1], unit="ms", tz="UTC"),
             model.mean_val_auc,
         )

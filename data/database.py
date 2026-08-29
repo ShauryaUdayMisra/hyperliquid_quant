@@ -52,7 +52,10 @@ DATASET_SPECS: dict[str, dict[str, object]] = {
     "decisions": {"partition": ("coin",), "key": ("coin", "ts_ms"), "grain": "day"},
     # Every attempt to refit the live model, promoted or not. Kept so a
     # change in behaviour can be traced to the day the model changed.
-    "retrains": {"partition": (), "key": ("ts_ms",), "grain": "month"},
+    # Keyed by side as well as time: the long and short models refit in the
+    # same pass, so two rows share a timestamp and a time-only key would
+    # silently keep just one of them.
+    "retrains": {"partition": (), "key": ("ts_ms", "side"), "grain": "month"},
 }
 
 

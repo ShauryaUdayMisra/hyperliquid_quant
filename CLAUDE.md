@@ -55,6 +55,30 @@ same close.
 `MarketView` and calls the same `ModelStrategy.on_bar`. Do not fork this
 logic — divergence would make the backtest stop being evidence about live.
 
+**It trades both sides, on two separate models.** `model.pkl` asks
+P(rise > +0.30%); `model_down.pkl` asks P(fall > 0.30%). They are not
+complements: between them sits "goes nowhere", which is most bars, so a low
+P(up) means "do not buy" and never "sell short". A short is taken only when
+the down-model clears its own threshold. Everything below the model already
+handled signed sizes -- short liquidation against intrabar highs, shorts
+receiving funding, `desired = -1.0` -- the only missing piece was ever that
+nothing trained a down-model, which made the whole path unreachable. If
+`model_down.pkl` is absent the system is long-only and says so loudly in the
+logs, the dashboard and the email; it does not fail. Two consequences worth
+holding on to: confidence for a short is measured against the *down* model's
+base rate (the portfolio ranks both sides against each other for a limited
+number of slots, so one scale for both is required), and `run_shuffled_control`
+permutes *both* models, because a control that keeps half the signal is not a
+control.
+
+Shorting is not a fix for the lack of edge. Measured, 3 markets, aggressive,
+0.40 threshold: long-only wiped out in 49 days over 70 trades at a 17.1% win
+rate; long+short survived the full 209 days and still finished at **$0.74**
+over 674 trades at a 44.2% win rate. Win rate more than doubled, profit
+factor went 0.14 → 0.49, and the account still went to zero — annualised
+turnover 1,152x → 2,604x and slippage $111k → $292k. The binding constraint
+is turnover against costs, not the inability to trade the downside.
+
 **The model has to keep learning, and it has to be marked.** Trained once at
 first boot, it never sees a bar of the market it trades: the same setup can go
 against it every day and the next prediction is identical to the first.
@@ -92,9 +116,16 @@ point on that curve deliberately, and never remove the floor entirely.
 **Activity rules sit outside the model** (`strategy/signals.py`,
 `config.settings.StrategyConfig`). `MAX_HOLD_HOURS` force-closes any position
 past its age regardless of how good the probability still looks; re-entry on
-a later bar is allowed. `MAX_IDLE_HOURS` opens the strongest candidate after
-that long holding nothing, even though it never cleared the entry threshold. Both buy activity, not accuracy — the forced trades are by
-construction the ones the model was not confident enough to ask for. Both
+a later bar is allowed. `MAX_IDLE_HOURS` is a *ceiling on idleness*, not a
+trading cadence: the clock runs only while the account holds nothing at all
+and resets the moment any position is open, so the system trades its own
+signals whenever it has one and the forced entry is only the backstop for a
+long flat stretch. When it does fire it opens the strongest candidate in
+*whichever direction* the models lean — in a falling market every forced long
+was a trade taken against the evidence, and this rule forces up to
+`MAX_OPEN_POSITIONS` of them at once. Both rules buy activity, not accuracy —
+the forced trades are by construction the ones the model was not confident
+enough to ask for. Both
 clocks are timestamps, never counters: position age comes from
 `Position.opened_ts_ms` and the idle clock is persisted in the state file's
 `extra` blob and restored on boot. Counted in memory, each redeploy reset them
@@ -119,12 +150,12 @@ plants a deliberate leak to prove the checker works.
 ## Commands
 
 ```bash
-.venv/bin/python -m pytest              # 451 tests (+4 live, run with -m live)
+.venv/bin/python -m pytest              # 460 tests (+4 live, run with -m live)
 .venv/bin/python main.py status         # API reachability + safety checks
 .venv/bin/python main.py prove-accounting
 .venv/bin/python main.py backfill --days 400 --intervals 1h
 .venv/bin/python main.py verify         # gaps, future timestamps
-.venv/bin/python main.py train --interval 1h
+.venv/bin/python main.py train --interval 1h   # both sides; --direction up|down
 .venv/bin/python main.py retrain           # refit the live model on fresh data
 .venv/bin/python main.py scorecard         # mark the live model's own calls
 .venv/bin/python main.py backtest --control    # --control = shuffled baseline
@@ -274,6 +305,7 @@ trade rather than sit flat. Railway variables now:
 | `MAX_OPEN_POSITIONS` | `20` | Held at once. A forced entry fills every free slot, not just one. |
 | `MAX_POSITION_USD` | `10000` | Per position. 20 x $10k = $200k gross on $100k equity, i.e. 2x used of the 10x allowed. |
 | `MIN_HOLD_HOURS` | `4` | A fading probability may not close a position younger than this. Risk exits ignore it. |
+| `SHORT_THRESHOLD` | = `SIGNAL_THRESHOLD` | P(down) needed to open a short. Shorting requires `model_down.pkl` beside `model.pkl`. |
 
 He was shown the measured consequences and chose this anyway. **Do not
 quietly re-tighten these.** If the account collapses or liquidates, that is
@@ -292,7 +324,7 @@ The two things that were *not* removed, and should not be:
 
 ## Current status
 
-Phases 1-8 of the original brief are built. 451 tests pass.
+Phases 1-8 of the original brief are built. 460 tests pass.
 
 **The model has no demonstrated edge.** On 208 days of real BTC/ETH/SOL
 hourly data:

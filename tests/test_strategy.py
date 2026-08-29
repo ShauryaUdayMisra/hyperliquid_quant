@@ -680,3 +680,137 @@ def test_a_healthy_market_logs_no_warmup_warning(system, caplog) -> None:
     with caplog.at_level(logging.WARNING, logger="strategy.signals"):
         assert strategy._signal_for(coin, 0) is not None
     assert not [r for r in caplog.records if "will not be scored" in r.getMessage()]
+
+
+# ==========================================================================
+# Shorting
+# ==========================================================================
+
+def _signal(coin="BTC", *, p_up=0.5, p_down=None, direction="flat",
+            base=0.33, down_base=0.33):
+    from models.predict import Signal
+
+    return Signal(
+        coin=coin, ts_ms=0, probability=p_up, base_rate=base,
+        direction=direction, down_probability=p_down,
+        down_base_rate=None if p_down is None else down_base,
+    )
+
+
+def test_confidence_scores_a_short_on_the_model_that_expressed_it() -> None:
+    """The portfolio ranks candidates by confidence to allocate a limited
+    number of slots. Scoring a short by how far P(up) sits from the up-model's
+    base rate would rank the two sides on different scales and quietly favour
+    one of them."""
+    short = _signal(p_up=0.30, p_down=0.62, direction="short",
+                    base=0.33, down_base=0.32)
+    # 0.62 vs a 0.32 base is a strong down call; 0.30 vs a 0.33 base is nothing.
+    assert short.confidence > 0.4
+
+    long = _signal(p_up=0.62, p_down=0.30, direction="long",
+                   base=0.32, down_base=0.33)
+    assert long.confidence == pytest.approx(short.confidence, abs=0.02)
+
+
+def test_a_flat_signal_is_still_scored_on_the_up_model() -> None:
+    flat = _signal(p_up=0.20, p_down=0.40, direction="flat")
+    assert flat.confidence == pytest.approx(abs(0.20 - 0.33) / 0.67, abs=1e-6)
+
+
+def test_without_a_down_model_a_forced_entry_is_still_long_only() -> None:
+    """A low P(up) means "do not buy", never "sell short". Forcing a short on
+    that would be inventing a signal that does not exist."""
+    from strategy.signals import ModelStrategy
+
+    strategy = ModelStrategy.__new__(ModelStrategy)
+    direction, _strength = strategy._forced_direction(_signal(p_up=0.05))
+    assert direction == "long"
+
+
+def test_a_forced_entry_goes_short_when_the_down_model_leans_harder() -> None:
+    """In a falling market every forced long is a trade taken against the
+    evidence, and this rule forces up to twenty of them at once."""
+    from strategy.signals import ModelStrategy
+
+    strategy = ModelStrategy.__new__(ModelStrategy)
+    direction, strength = strategy._forced_direction(
+        _signal(p_up=0.20, p_down=0.55, base=0.33, down_base=0.33)
+    )
+    assert direction == "short"
+    assert strength == pytest.approx(0.22, abs=1e-6)
+
+
+def test_a_forced_entry_goes_long_when_the_up_model_leans_harder() -> None:
+    from strategy.signals import ModelStrategy
+
+    strategy = ModelStrategy.__new__(ModelStrategy)
+    direction, _ = strategy._forced_direction(
+        _signal(p_up=0.50, p_down=0.35, base=0.33, down_base=0.33)
+    )
+    assert direction == "long"
+
+
+def test_the_two_sides_are_compared_against_their_own_base_rates() -> None:
+    """The up and down questions have different unconditional rates. Comparing
+    raw probabilities would hand every forced trade to whichever side happens
+    to fire more often."""
+    from strategy.signals import ModelStrategy
+
+    strategy = ModelStrategy.__new__(ModelStrategy)
+    # P(down) is the larger number, but it is *below* its own base rate while
+    # P(up) is well above its own. The long is the real signal.
+    direction, _ = strategy._forced_direction(
+        _signal(p_up=0.45, p_down=0.60, base=0.20, down_base=0.70)
+    )
+    assert direction == "long"
+
+
+def test_a_down_model_lets_the_strategy_actually_sell_short(system) -> None:
+    """End to end: a confident down-model must produce a negative target.
+
+    Every layer below this already handled signed sizes -- the gap was that
+    nothing ever supplied a down-model, so _direction could never return
+    "short" and the whole short path was unreachable.
+    """
+    from backtest.engine import MarketView
+
+    universe, matrices, generator = system
+    limits = resolve_risk_profile("conservative")
+    execution = ExecutionConfig()
+    exchange = PaperExchange(
+        limits.starting_capital, config=execution, simulator=FillSimulator(execution)
+    )
+
+    # A down-model that is certain, so the decision is unambiguous.
+    class CertainlyDown:
+        features = generator.model.features
+        label_config = type("L", (), {"name": "P(return_4bar < -0.30%)"})()
+        class_balance = {"positive_rate": 0.33}
+
+        def predict_proba(self, X):
+            return np.full(len(X), 0.99)
+
+    shorting = SignalGenerator(
+        generator.model, down_model=CertainlyDown(),
+        long_threshold=0.99, short_threshold=0.50,
+    )
+    strategy = ModelStrategy(
+        shorting, RiskEngine(limits, execution), matrices, precompute=False
+    )
+    engine = BacktestEngine(
+        universe,
+        BacktestConfig(interval="1h", warmup_bars=800, asset_max_leverage={"BTC": 40.0}),
+        risk=limits, exchange=exchange, features=matrices,
+    )
+    snapshots = {c: engine._snapshot(c, 900) for c in universe}
+    view = MarketView(900, snapshots[next(iter(universe))].ts_ms, universe,
+                      snapshots, exchange, limits, matrices)
+
+    orders = list(strategy.on_bar(view))
+    assert orders, "a certain down-model produced no orders at all"
+    assert any(o.side.value == "sell" for o in orders), "it never sold short"
+
+    shorts = [d for d in strategy.decisions if d.action == "short"]
+    assert shorts, "no decision was recorded as a short"
+    # Reported by the model that authorised it, not by P(up).
+    assert "< -0.30%" in shorts[0].signal.down_label_question

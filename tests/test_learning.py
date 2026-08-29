@@ -8,6 +8,7 @@ model behind the live strategy without letting a broken one through.
 
 from __future__ import annotations
 
+import pathlib
 import pickle
 
 import numpy as np
@@ -379,6 +380,9 @@ def bare_trader(*, every_hours: float = 24.0, last_retrain_ms: int = BASE_MS):
     trader.model = fake_model(0.504)
     trader.model_path = "unused.pkl"
     trader.long_threshold = 0.40
+    trader.short_threshold = 0.40
+    trader.down_model = None
+    trader.down_model_path = pathlib.Path("unused_down.pkl")
     trader.generator = SignalGenerator(trader.model, long_threshold=0.40)
     trader.strategy = StubStrategy(trader.generator)
     trader.settings = SETTINGS
@@ -452,7 +456,7 @@ def test_the_retrain_clock_is_persisted_so_a_redeploy_cannot_reset_it() -> None:
     assert extra["model_trained_at_ms"] == trader.model.trained_at_ms
 
 
-def _run_maybe_retrain(monkeypatch, outcome: RetrainOutcome, *, now_ms: int):
+def _run_maybe_retrain(monkeypatch, *outcomes: RetrainOutcome, now_ms: int):
     import execution.paper_trader as module
 
     trader = bare_trader(every_hours=1.0, last_retrain_ms=BASE_MS)
@@ -460,7 +464,7 @@ def _run_maybe_retrain(monkeypatch, outcome: RetrainOutcome, *, now_ms: int):
     saves: list[dict] = []
     trader.state_store = type("S", (), {"save": lambda _s, _e, extra: saves.append(extra)})()
     trader.exchange = object()
-    monkeypatch.setattr(module, "retrain", lambda **kwargs: outcome)
+    monkeypatch.setattr(module, "retrain_pair", lambda **kwargs: list(outcomes))
     monkeypatch.setattr(module, "record_retrain", lambda *a, **k: None)
     monkeypatch.setattr(
         module, "load_scorecard", lambda **kwargs: scored([0.9, 0.1, 0.2, 0.8])
@@ -472,12 +476,12 @@ def test_a_rejected_candidate_still_advances_the_clock(monkeypatch) -> None:
     """The same data would lose the same comparison an hour later. Retrying
     every cycle would burn the box for a foregone conclusion."""
     now = BASE_MS + 2 * HOUR
-    trader, outcome, saves = _run_maybe_retrain(
+    trader, outcomes, saves = _run_maybe_retrain(
         monkeypatch,
         RetrainOutcome(ts_ms=now, status="rejected", reason="worse"),
         now_ms=now,
     )
-    assert outcome.status == "rejected"
+    assert outcomes[0].status == "rejected"
     assert trader._last_retrain_ms == now
     assert saves and saves[0]["last_retrain_ms"] == now
 
@@ -485,12 +489,12 @@ def test_a_rejected_candidate_still_advances_the_clock(monkeypatch) -> None:
 def test_too_little_new_data_leaves_the_clock_alone(monkeypatch) -> None:
     """A skip costs nothing and should be retried, not deferred a full day."""
     now = BASE_MS + 2 * HOUR
-    trader, outcome, _ = _run_maybe_retrain(
+    trader, outcomes, _ = _run_maybe_retrain(
         monkeypatch,
         RetrainOutcome(ts_ms=now, status="skipped", reason="nothing new"),
         now_ms=now,
     )
-    assert outcome.status == "skipped"
+    assert outcomes[0].status == "skipped"
     assert trader._last_retrain_ms == BASE_MS
 
 
@@ -499,14 +503,45 @@ def test_a_promoted_candidate_goes_live_immediately(monkeypatch) -> None:
 
     now = BASE_MS + 2 * HOUR
     fresh = fake_model(0.51)
-    trader, outcome, _ = _run_maybe_retrain(
+    trader, outcomes, _ = _run_maybe_retrain(
         monkeypatch,
         RetrainOutcome(ts_ms=now, status="promoted", reason="fresher", model=fresh),
         now_ms=now,
     )
-    assert outcome.promoted
+    assert outcomes[0].promoted
     assert trader.model is fresh
     assert isinstance(trader.generator, SignalGenerator)
+
+
+def test_each_side_of_the_book_is_promoted_on_its_own_merit(monkeypatch) -> None:
+    """The long and short models are two independent opinions, not a matched
+    set. A good new long model must not be held back because the short model
+    came out worse than its incumbent."""
+    now = BASE_MS + 2 * HOUR
+    fresh_long, fresh_short = fake_model(0.51), fake_model(0.52)
+    trader, outcomes, _ = _run_maybe_retrain(
+        monkeypatch,
+        RetrainOutcome(ts_ms=now, side="up", status="promoted",
+                       reason="fresher", model=fresh_long),
+        RetrainOutcome(ts_ms=now, side="down", status="rejected", reason="worse"),
+        now_ms=now,
+    )
+    assert len(outcomes) == 2
+    assert trader.model is fresh_long
+    assert trader.down_model is None, "a rejected short model was deployed anyway"
+
+
+def test_a_promoted_short_model_goes_behind_the_live_strategy(monkeypatch) -> None:
+    now = BASE_MS + 2 * HOUR
+    fresh_short = fake_model(0.52)
+    trader, _outcomes, _ = _run_maybe_retrain(
+        monkeypatch,
+        RetrainOutcome(ts_ms=now, side="down", status="promoted",
+                       reason="fresher", model=fresh_short),
+        now_ms=now,
+    )
+    assert trader.down_model is fresh_short
+    assert trader.generator.down_model is fresh_short, "the strategy cannot short with it"
 
 
 def test_a_retrain_that_blows_up_does_not_take_the_trader_down(monkeypatch) -> None:
@@ -521,12 +556,12 @@ def test_a_retrain_that_blows_up_does_not_take_the_trader_down(monkeypatch) -> N
     def explode(**kwargs):
         raise MemoryError("training ran out of room")
 
-    monkeypatch.setattr(module, "retrain", explode)
+    monkeypatch.setattr(module, "retrain_pair", explode)
     monkeypatch.setattr(module, "load_scorecard", lambda **kwargs: scored([0.5]))
 
-    outcome = trader._maybe_retrain(now)
-    assert outcome.status == "failed"
-    assert "MemoryError" in outcome.reason
+    outcomes = trader._maybe_retrain(now)
+    assert outcomes[0].status == "failed"
+    assert "MemoryError" in outcomes[0].reason
     assert trader._last_retrain_ms == now, "a failure must not retry every cycle"
 
 

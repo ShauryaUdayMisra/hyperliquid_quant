@@ -237,37 +237,64 @@ def _load_market_data(args):
 
 
 def cmd_train(args: argparse.Namespace) -> int:
+    """Train the long-side model, the short-side model, or both.
+
+    Two separate questions, deliberately. "Will it rise more than 0.30%" and
+    "will it fall more than 0.30%" are not complements -- between them sits
+    "it goes nowhere", which is most bars. Inferring a short from a low
+    P(up) would be treating the third case as the second, so a short is only
+    ever taken on a model trained to answer that question.
+    """
     from features.pipeline import FeatureConfig, build_universe
     from models.backend import ModelParams
     from models.dataset import SplitConfig, assemble
     from models.labels import LabelConfig
-    from models.train import evaluate_holdout, render_report, train_walk_forward
+    from models.train import (
+        down_model_path,
+        evaluate_holdout,
+        render_report,
+        train_walk_forward,
+    )
+
+    from pathlib import Path
 
     bars, funding, books, interval = _load_market_data(args)
     print(f"Building features for {list(bars)} at {interval}...")
+    # Built once and labelled twice: the features are identical, only the
+    # question changes, and the feature build is the expensive half.
     matrices = build_universe(
         bars, funding_by_coin=funding, book_by_coin=books,
         config=FeatureConfig(interval=interval),
     )
 
-    label_config = LabelConfig(horizon_bars=args.horizon, threshold=args.threshold)
-    dataset = assemble(matrices, label_config)
-    print(f"Training on {len(dataset):,} rows, asking: {label_config.name}\n")
+    base = Path(args.output or SETTINGS.paths.models / "model.pkl")
+    directions = ["up", "down"] if args.direction == "both" else [args.direction]
 
-    model, holdout = train_walk_forward(
-        dataset,
-        label_config=label_config,
-        split_config=SplitConfig(n_folds=args.folds, test_fraction=args.test_fraction),
-        params=ModelParams(),
-    )
-    if not args.skip_holdout:
-        # Called once, after the model is frozen. Anything tuned from here on
-        # makes this number in-sample.
-        evaluate_holdout(model, holdout)
+    for direction in directions:
+        label_config = LabelConfig(
+            horizon_bars=args.horizon, threshold=args.threshold, direction=direction,
+        )
+        dataset = assemble(matrices, label_config)
+        print(f"\nTraining on {len(dataset):,} rows, asking: {label_config.name}\n")
 
-    print(render_report(model))
-    path = model.save(args.output or SETTINGS.paths.models / "model.pkl")
-    print(f"\nModel written to {path}")
+        model, holdout = train_walk_forward(
+            dataset,
+            label_config=label_config,
+            split_config=SplitConfig(n_folds=args.folds, test_fraction=args.test_fraction),
+            params=ModelParams(),
+        )
+        if not args.skip_holdout:
+            # Called once, after the model is frozen. Anything tuned from here
+            # on makes this number in-sample.
+            evaluate_holdout(model, holdout)
+
+        print(render_report(model))
+        path = model.save(base if direction == "up" else down_model_path(base))
+        print(f"\nModel written to {path}")
+
+    if args.direction == "both":
+        print("\nThe strategy will short only where the down-model clears its own "
+              "threshold; a low P(up) still means 'do not buy', never 'sell short'.")
     return 0
 
 
@@ -317,11 +344,13 @@ def cmd_retrain(args: argparse.Namespace) -> int:
 
     import pandas as pd
 
-    from models.retrain import record, retrain
-    from models.train import TrainedModel, render_report
+    from models.retrain import record, retrain_pair
+    from models.train import TrainedModel, down_model_path, render_report
 
     path = Path(args.model or SETTINGS.paths.models / "model.pkl")
     incumbent = TrainedModel.load(path) if path.exists() else None
+    down_path = down_model_path(path)
+    down_incumbent = TrainedModel.load(down_path) if down_path.exists() else None
     if incumbent is not None:
         print(
             f"Incumbent: {incumbent.backend_name}, trained "
@@ -333,30 +362,48 @@ def cmd_retrain(args: argparse.Namespace) -> int:
     else:
         print(f"No incumbent at {path}; this will be the first model.")
 
-    outcome = retrain(
+    if down_incumbent is None:
+        print(f"No short-side model at {down_path}; the long side will refit alone.")
+
+    outcomes = retrain_pair(
         coins=_configured_markets(),
         interval=args.interval,
         model_path=path,
         incumbent=incumbent,
+        down_incumbent=down_incumbent,
         force=args.force,
         dry_run=args.dry_run,
     )
-    if not args.dry_run:
-        record(outcome)
-    print(f"\n{outcome.describe()}")
-    if outcome.model is not None:
-        print()
-        print(render_report(outcome.model))
-    return 0 if outcome.status in {"promoted", "rejected", "skipped"} else 1
+    for outcome in outcomes:
+        if not args.dry_run:
+            record(outcome)
+        print(f"\n{outcome.describe()}")
+        if outcome.model is not None:
+            print()
+            print(render_report(outcome.model))
+    return 0 if all(
+        o.status in {"promoted", "rejected", "skipped"} for o in outcomes
+    ) else 1
 
 
 def cmd_backtest(args: argparse.Namespace) -> int:
+    from pathlib import Path
+
     from backtest.runner import run_backtest
     from config.settings import resolve_risk_profile
-    from models.train import TrainedModel
+    from models.train import TrainedModel, down_model_path
 
-    model_path = args.model or SETTINGS.paths.models / "model.pkl"
+    model_path = Path(args.model or SETTINGS.paths.models / "model.pkl")
     model = TrainedModel.load(model_path)
+
+    # The backtest runs the pair the live system runs. Backtesting long-only
+    # while live can short would make the backtest evidence about a system
+    # that is not deployed.
+    down_path = down_model_path(model_path)
+    down_model = TrainedModel.load(down_path) if down_path.exists() else None
+    print("Shorting: " + (f"enabled ({down_path.name})" if down_model
+                          else "disabled (no down-model; long-only)"))
+
     bars, funding, books, interval = _load_market_data(args)
 
     limits = resolve_risk_profile(args.profile) if args.profile else SETTINGS.risk
@@ -364,9 +411,11 @@ def cmd_backtest(args: argparse.Namespace) -> int:
 
     report = run_backtest(
         bars, model,
+        down_model=down_model,
         funding_by_coin=funding, book_by_coin=books,
         limits=limits, interval=interval,
         long_threshold=args.threshold,
+        short_threshold=args.short_threshold or args.threshold,
         out_of_sample_from_ms=model.train_span[1],
     )
     print(report.render())
@@ -403,15 +452,24 @@ def cmd_paper(args: argparse.Namespace) -> int:
     from reporting.scheduler import ReportService, build_scheduler
 
     trader = PaperTrader(
-        model_path=args.model, interval=args.interval, long_threshold=args.threshold
+        model_path=args.model, interval=args.interval,
+        long_threshold=args.threshold,
+        short_threshold=args.short_threshold,
     )
     service = ReportService(trader)
 
     print("PAPER TRADING - simulated fills against live Hyperliquid data.")
     print(f"  risk profile : {SETTINGS.risk.describe()}")
     print(f"  markets      : {', '.join(trader.coins)}")
-    print(f"  entry        : P(up) >= {args.threshold:.2f} "
-          f"(model base rate {trader.generator._base_rate:.2f}); long-only")
+    if trader.down_model is not None:
+        print(f"  entry        : P(up) >= {args.threshold:.2f} to go long, "
+              f"P(down) >= {trader.short_threshold:.2f} to go short")
+        print(f"  short side   : {trader.down_model.label_config.name} "
+              f"(base rate {trader.generator._down_base_rate:.2f})")
+    else:
+        print(f"  entry        : P(up) >= {args.threshold:.2f} "
+              f"(model base rate {trader.generator._base_rate:.2f}); LONG-ONLY "
+              f"- no down-model, so it can only sit out a falling market")
     print(f"  activity     : {SETTINGS.strategy.describe()}")
     print(f"  learning     : {SETTINGS.learning.describe()}")
     print(f"  reports      : {'on' if SETTINGS.report.enabled else 'OFF'} "
@@ -509,6 +567,8 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--test-fraction", type=float, default=0.2)
     train.add_argument("--skip-holdout", action="store_true",
                        help="do not score the locked test set (keeps it unused)")
+    train.add_argument("--direction", default="both", choices=["both", "up", "down"],
+                       help="train the long side, the short side, or both (default)")
     train.add_argument("--output", default=None)
     train.set_defaults(func=cmd_train)
 
@@ -543,6 +603,8 @@ def build_parser() -> argparse.ArgumentParser:
     backtest.add_argument("--profile", default=None, choices=["conservative", "aggressive"])
     backtest.add_argument("--threshold", type=float, default=0.55,
                           help="probability above which the strategy goes long")
+    backtest.add_argument("--short-threshold", type=float, default=None,
+                          help="P(down) above which it goes short (default: --threshold)")
     backtest.add_argument("--control", action="store_true",
                           help="also run a shuffled-prediction control for comparison")
     backtest.set_defaults(func=cmd_backtest)
@@ -550,7 +612,10 @@ def build_parser() -> argparse.ArgumentParser:
     paper = sub.add_parser("paper", help="run live paper trading (simulated fills, real data)")
     paper.add_argument("--interval", default="1h")
     paper.add_argument("--model", default=None)
-    paper.add_argument("--threshold", type=float, default=0.55)
+    paper.add_argument("--threshold", type=float, default=0.55,
+                       help="P(up) to go long")
+    paper.add_argument("--short-threshold", type=float, default=None,
+                       help="P(down) to go short (default: --threshold)")
     paper.add_argument("--cycles", type=int, default=None, help="stop after N cycles")
     paper.set_defaults(func=cmd_paper)
 

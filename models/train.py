@@ -171,6 +171,17 @@ class TrainedModel:
             return pickle.load(handle)
 
 
+def down_model_path(model_path: Path | str) -> Path:
+    """Where the short-side model lives, given the long-side one.
+
+    A sibling file rather than a second directory, so the pair travels
+    together: on Railway they share one volume, and a long model without its
+    matching short model silently turns the system long-only again.
+    """
+    path = Path(model_path)
+    return path.with_name(f"{path.stem}_down{path.suffix}")
+
+
 def plausibility_warnings(model: TrainedModel) -> list[str]:
     """Reasons to distrust a result. An empty list is the good outcome."""
     warnings: list[str] = []

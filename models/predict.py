@@ -48,8 +48,15 @@ class Signal:
     regime: str = "unknown"
     top_features: list[FeatureContribution] = field(default_factory=list)
     down_probability: float | None = None
+    #: The down-model's own unconditional rate. Kept beside the up-model's
+    #: because the two questions have different base rates, and confidence
+    #: is measured against whichever one the signal is actually expressing.
+    down_base_rate: float | None = None
     model_backend: str = ""
     label_question: str = ""
+    #: The short side's question, so a short can be reported by the model
+    #: that actually authorised it.
+    down_label_question: str = ""
     explanation_method: str = "none"
 
     @property
@@ -58,11 +65,21 @@ class Signal:
 
         Measured against the base rate rather than 0.5: if only 20% of bars
         are positive, predicting 0.35 is a strong opinion, not a weak one.
+
+        A short is scored on the *down* model against the *down* base rate.
+        The portfolio ranks candidates by this number to allocate a limited
+        number of slots, so scoring a short by how far P(up) sits from the
+        up-model's base rate would rank longs and shorts on two different
+        scales and quietly favour one side.
         """
-        denominator = max(self.base_rate, 1.0 - self.base_rate)
+        probability, base = self.probability, self.base_rate
+        if self.direction == "short" and self.down_probability is not None:
+            probability = self.down_probability
+            base = self.base_rate if self.down_base_rate is None else self.down_base_rate
+        denominator = max(base, 1.0 - base)
         if denominator <= 0:
             return 0.0
-        return float(min(1.0, abs(self.probability - self.base_rate) / denominator))
+        return float(min(1.0, abs(probability - base) / denominator))
 
     @property
     def edge(self) -> float:
@@ -100,6 +117,10 @@ class SignalGenerator:
         self.short_threshold = short_threshold
         self.top_n_features = top_n_features
         self._base_rate = float(model.class_balance.get("positive_rate", 0.5))
+        self._down_base_rate = (
+            float(down_model.class_balance.get("positive_rate", 0.5))
+            if down_model is not None else None
+        )
         # Prefer the scales frozen with the model. Falling back to
         # calibrate_feature_scales() supports artefacts trained before these
         # were stored, and keeps the explicit override available for tests.
@@ -190,8 +211,13 @@ class SignalGenerator:
                     regime=str(row.get("regime", "unknown")),
                     top_features=explanations[i],
                     down_probability=p_down,
+                    down_base_rate=self._down_base_rate,
                     model_backend=self.model.backend_name,
                     label_question=self.model.label_config.name,
+                    down_label_question=(
+                        self.down_model.label_config.name
+                        if self.down_model is not None else ""
+                    ),
                     explanation_method=method,
                 )
             )

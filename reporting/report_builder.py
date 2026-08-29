@@ -404,6 +404,14 @@ def learning_lines(learning: dict[str, Any]) -> list[str]:
     else:
         lines.append("No model artefact could be read.")
 
+    shorting = learning.get("shorting") or {}
+    if shorting:
+        lines.append(
+            f"Shorting: ON, asking {shorting.get('question', '?')}"
+            if shorting.get("enabled")
+            else "Shorting: OFF - long-only, so a falling market can only be sat out."
+        )
+
     retrain = learning.get("retrain") or {}
     if not retrain.get("enabled"):
         lines.append("Retraining is OFF - this model is frozen at its first fit.")

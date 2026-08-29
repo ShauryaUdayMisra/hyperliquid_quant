@@ -85,6 +85,13 @@ class ReportService:
                     "trained_through_ms": model.train_span[1],
                     "val_auc": model.mean_val_auc,
                 },
+                "shorting": {
+                    "enabled": self.trader.down_model is not None,
+                    "question": (
+                        self.trader.down_model.label_config.name
+                        if self.trader.down_model is not None else None
+                    ),
+                },
                 "retrain": {
                     "enabled": every_ms is not None,
                     "next_ms": (last + every_ms) if every_ms else None,
