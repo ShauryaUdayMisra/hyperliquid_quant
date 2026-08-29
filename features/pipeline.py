@@ -91,6 +91,84 @@ def build_for_coin(
     return matrix
 
 
+def align_bars(
+    bars_by_coin: dict[str, pd.DataFrame], *, min_history_share: float = 0.5
+) -> dict[str, pd.DataFrame]:
+    """Put every market on one timestamp grid before features are built.
+
+    The cross-asset block refuses to run on frames of different lengths, and
+    it is right to: correlating one coin's Monday with another's Tuesday is
+    worse than having no cross-asset feature at all. But in real storage the
+    markets are never equal -- one was topped up a minute later than the
+    next, one was listed last week -- so something has to reconcile them,
+    and an exception is not it. Unaligned markets raised
+    ``coins are not aligned`` from deep inside the feature build, which took
+    down the whole call: the "one bad market must never stop the rest" rule,
+    in the one place a scheduled retrain would meet it every time.
+
+    Two steps, in this order:
+
+    1. **Drop the stragglers.** A market with a fraction of everyone else's
+       history is usually newly listed. Intersecting with it would throw
+       away months of every other market's bars to accommodate it, so it is
+       dropped instead and the rest keep their depth.
+    2. **Inner-join the survivors.** Only the timestamps they all share.
+       Never forward-fill: that invents a price, and back-filling a coin
+       that started later gives it a history it did not have.
+
+    Callers must align *bars*, not the matrices built from them: the live
+    loop and the backtest both index a coin's feature frame by the same
+    position they index its bars, so a matrix that is shorter than its bars
+    would score the wrong row.
+    """
+    usable = {c: f for c, f in bars_by_coin.items() if not f.empty}
+    if len(usable) < 2:
+        return usable
+
+    lengths = {c: len(f) for c, f in usable.items()}
+    longest = max(lengths.values())
+    floor = longest * min_history_share
+    short = sorted(c for c, n in lengths.items() if n < floor)
+    if short:
+        log.warning(
+            "%d market(s) have less than %.0f%% of the deepest history and are "
+            "left out of this feature build rather than truncating everyone to "
+            "them: %s",
+            len(short), min_history_share * 100,
+            ", ".join(f"{c} ({lengths[c]:,} bars)" for c in short),
+        )
+        usable = {c: f for c, f in usable.items() if c not in set(short)}
+        if len(usable) < 2:
+            return usable
+
+    common: set[int] | None = None
+    for frame in usable.values():
+        stamps = set(frame["ts_ms"].astype("int64"))
+        common = stamps if common is None else (common & stamps)
+    if not common:
+        raise ValueError(
+            f"{len(usable)} market(s) share no common timestamp; they cannot be "
+            "put on one grid"
+        )
+
+    keep = np.array(sorted(common), dtype=np.int64)
+    dropped = max(lengths[c] for c in usable) - len(keep)
+    if dropped:
+        log.info(
+            "aligned %d market(s) onto %d shared bar(s); %d unshared bar(s) set "
+            "aside", len(usable), len(keep), dropped,
+        )
+    return {
+        coin: (
+            frame if len(frame) == len(keep) and frame["ts_ms"].is_monotonic_increasing
+            else frame.loc[frame["ts_ms"].isin(keep)]
+                      .sort_values("ts_ms")
+                      .reset_index(drop=True)
+        )
+        for coin, frame in usable.items()
+    }
+
+
 def build_universe(
     bars_by_coin: dict[str, pd.DataFrame],
     *,

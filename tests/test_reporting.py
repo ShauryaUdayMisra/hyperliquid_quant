@@ -322,3 +322,83 @@ def test_credentials_never_appear_in_the_rendered_report(report) -> None:
     text = render_text(report) + render_html(report)
     assert "SMTP_APP_PASSWORD" not in text
     assert "password" not in text.lower()
+
+
+# ==========================================================================
+# The model paragraph
+# ==========================================================================
+
+def _learning(**overrides) -> dict:
+    base = {
+        "model": {
+            "backend": "lightgbm",
+            "question": "P(return_4bar > +0.30%)",
+            "features": 106,
+            "trained_through_ms": 1_767_225_600_000,
+            "val_auc": 0.5042,
+        },
+        "retrain": {
+            "enabled": True,
+            "next_ms": 1_767_312_000_000,
+            "last_outcome": "retrain promoted: fresher data",
+        },
+        "scorecard": "LIVE SCORECARD\n  resolved calls : 1,204\n  live AUC : 0.4980",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_the_report_says_which_model_made_the_decisions() -> None:
+    """The model refits itself on a schedule. Without this, a change in
+    behaviour is indistinguishable from a change in the market."""
+    from reporting.report_builder import learning_lines
+
+    text = "\n".join(learning_lines(_learning()))
+    assert "lightgbm" in text
+    assert "0.5042" in text
+    assert "coin flip" in text
+    assert "live AUC : 0.4980" in text
+
+
+def test_the_report_says_when_the_model_next_changes() -> None:
+    from reporting.report_builder import learning_lines
+
+    assert any("Next refit" in line for line in learning_lines(_learning()))
+
+
+def test_a_frozen_model_is_reported_as_frozen() -> None:
+    """Silence would read as "it is learning", which would be a lie."""
+    from reporting.report_builder import learning_lines
+
+    lines = learning_lines(_learning(retrain={"enabled": False}))
+    assert any("Retraining is OFF" in line for line in lines)
+
+
+def test_both_renderings_carry_the_model_section() -> None:
+    """The plain-text fallback must contain everything the HTML does."""
+    from reporting.report_builder import ReportData, render_html, render_text
+
+    data = ReportData(
+        generated_ms=1_767_225_600_000,
+        window_start_ms=1_767_204_000_000,
+        window_end_ms=1_767_225_600_000,
+        profile="aggressive",
+        starting_capital=100_000.0,
+        equity=100_000.0,
+        cash=100_000.0,
+        unrealized=0.0,
+        pnl_window=0.0,
+        pnl_today=0.0,
+        pnl_all_time=0.0,
+        learning=_learning(),
+    )
+    for rendered in (render_text(data), render_html(data)):
+        assert "lightgbm" in rendered
+        assert "0.5042" in rendered
+
+
+def test_a_report_still_renders_when_the_model_cannot_be_read() -> None:
+    from reporting.report_builder import learning_lines
+
+    lines = learning_lines({"model": None, "retrain": {"enabled": True}})
+    assert any("No model artefact" in line for line in lines)

@@ -456,3 +456,95 @@ def test_alignment_matches_what_training_stacked(universe) -> None:
     stacked = assemble(matrices, LabelConfig())
     for coin, frame in matrices.items():
         assert set(feature_columns(frame)) == set(feature_columns(stacked))
+
+
+# ==========================================================================
+# Putting unequal markets on one grid
+# ==========================================================================
+
+def _bar_frame(stamps: list[int]) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "ts_ms": stamps,
+            "open": [100.0] * len(stamps),
+            "high": [101.0] * len(stamps),
+            "low": [99.0] * len(stamps),
+            "close": [100.5] * len(stamps),
+            "volume": [1.0] * len(stamps),
+        }
+    )
+
+
+def test_markets_are_inner_joined_onto_the_bars_they_share() -> None:
+    """Never forward-filled. Filling a missing bar invents a price, and
+    back-filling a coin that listed later gives it a history it never had."""
+    from features.pipeline import align_bars
+
+    aligned = align_bars(
+        {"BTC": _bar_frame([1, 2, 3, 4]), "ETH": _bar_frame([2, 3, 4, 5])}
+    )
+    assert list(aligned["BTC"]["ts_ms"]) == [2, 3, 4]
+    assert list(aligned["ETH"]["ts_ms"]) == [2, 3, 4]
+
+
+def test_a_newly_listed_market_is_dropped_rather_than_truncating_everyone() -> None:
+    """Intersecting with a coin listed last week would throw away months of
+    every other market's history to accommodate it."""
+    from features.pipeline import align_bars
+
+    aligned = align_bars(
+        {
+            "BTC": _bar_frame(list(range(100))),
+            "ETH": _bar_frame(list(range(100))),
+            "NEW": _bar_frame([98, 99]),
+        }
+    )
+    assert set(aligned) == {"BTC", "ETH"}
+    assert len(aligned["BTC"]) == 100
+
+
+def test_unequal_markets_no_longer_take_the_whole_feature_build_down() -> None:
+    """The cross-asset block raises on frames of different lengths, and in
+    real storage they always differ -- one market topped up a minute later,
+    one skipped by a rate limit. That exception took every market down with
+    it, which is the one failure this system keeps having."""
+    from features.pipeline import align_bars, build_universe
+
+    universe = synthetic_universe(400)
+    universe["ETH"] = universe["ETH"].iloc[:-3].reset_index(drop=True)
+
+    with pytest.raises(ValueError, match="not aligned"):
+        build_universe(universe)
+
+    matrices = build_universe(align_bars(universe))
+    assert set(matrices) == set(universe)
+
+
+def test_alignment_keeps_bars_and_their_matrices_the_same_length() -> None:
+    """The live loop and the backtest index a coin's feature frame by the
+    same position they index its bars. A matrix shorter than its bars would
+    silently score the wrong row."""
+    from features.pipeline import align_bars, build_universe
+
+    universe = synthetic_universe(400)
+    universe["SOL"] = universe["SOL"].iloc[2:].reset_index(drop=True)
+
+    bars = align_bars(universe)
+    matrices = build_universe(bars)
+    for coin, frame in bars.items():
+        assert len(matrices[coin]) == len(frame)
+
+
+def test_a_single_market_needs_no_alignment() -> None:
+    from features.pipeline import align_bars
+
+    only = {"BTC": _bar_frame([1, 2, 3])}
+    assert align_bars(only)["BTC"] is only["BTC"]
+
+
+def test_markets_sharing_no_bar_at_all_is_an_error_worth_raising() -> None:
+    """Silently returning an empty universe would look like a quiet market."""
+    from features.pipeline import align_bars
+
+    with pytest.raises(ValueError, match="no common timestamp"):
+        align_bars({"BTC": _bar_frame([1, 2, 3, 4]), "ETH": _bar_frame([5, 6, 7, 8])})

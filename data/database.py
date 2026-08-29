@@ -50,6 +50,9 @@ DATASET_SPECS: dict[str, dict[str, object]] = {
     "paper_fills": {"partition": ("coin",), "key": ("coin", "ts_ms", "fill_id"), "grain": "day"},
     "paper_trades": {"partition": ("coin",), "key": ("coin", "closed_ts_ms", "opened_ts_ms"), "grain": "day"},
     "decisions": {"partition": ("coin",), "key": ("coin", "ts_ms"), "grain": "day"},
+    # Every attempt to refit the live model, promoted or not. Kept so a
+    # change in behaviour can be traced to the day the model changed.
+    "retrains": {"partition": (), "key": ("ts_ms",), "grain": "month"},
 }
 
 

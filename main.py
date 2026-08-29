@@ -8,6 +8,8 @@
     python main.py summary                # what is on disk
     python main.py prove-accounting       # paper exchange arithmetic proof
     python main.py train                  # walk-forward model training
+    python main.py retrain                # refit the live model on fresh data
+    python main.py scorecard              # mark the live model's own calls
     python main.py backtest               # full system backtest + honest report
     python main.py paper                  # LIVE paper trading + 6-hour reports
     python main.py report --test-report   # send one report immediately
@@ -223,10 +225,14 @@ def cmd_summary(args: argparse.Namespace) -> int:
 
 def _load_market_data(args):
     from data.loader import load_bars, load_funding, load_order_books
+    from features.pipeline import align_bars
 
     coins = args.coins or _configured_markets()
     interval = getattr(args, "interval", "1h")
-    bars = load_bars(coins, interval)
+    # Stored markets are never equal in length -- different listing dates,
+    # a backfill that met a rate limit part-way. The feature build refuses
+    # to run on mismatched frames, so reconcile them here.
+    bars = align_bars(load_bars(coins, interval))
     return bars, load_funding(list(bars)), load_order_books(list(bars)), interval
 
 
@@ -263,6 +269,85 @@ def cmd_train(args: argparse.Namespace) -> int:
     path = model.save(args.output or SETTINGS.paths.models / "model.pkl")
     print(f"\nModel written to {path}")
     return 0
+
+
+def cmd_scorecard(args: argparse.Namespace) -> int:
+    """Mark the live model's own recorded predictions against what happened."""
+    from pathlib import Path
+
+    from config.settings import INTERVAL_MS
+    from models.scorecard import load_scorecard
+    from models.train import TrainedModel
+
+    path = Path(args.model or SETTINGS.paths.models / "model.pkl")
+    if not path.exists():
+        print(f"No model at {path}; nothing has been predicting.")
+        return 1
+    model = TrainedModel.load(path)
+
+    card = load_scorecard(
+        coins=_configured_markets(),
+        interval=args.interval,
+        interval_ms=INTERVAL_MS[args.interval],
+        label_config=model.label_config,
+        entry_threshold=args.threshold,
+    )
+    print(card.describe())
+    if not card.by_coin.empty:
+        print("\n  By market (most-called first):")
+        for row in card.by_coin.head(args.top).to_dict("records"):
+            print(
+                f"    {row['coin']:<10}{int(row['calls']):>7,} calls  "
+                f"said {row['mean_predicted']:.3f}  was {row['actual_rate']:.3f}  "
+                f"mean forward return {row['mean_forward_return']:+.3%}"
+            )
+    if not card.calibration.empty:
+        print("\n  Calibration (a well-calibrated model tracks the diagonal):")
+        for row in card.calibration.to_dict("records"):
+            print(
+                f"    predicted {row['mean_predicted']:.3f} -> actual "
+                f"{row['actual_rate']:.3f}   ({int(row['count']):,} calls)"
+            )
+    return 0
+
+
+def cmd_retrain(args: argparse.Namespace) -> int:
+    """Refit the deployed model on everything stored, including recent bars."""
+    from pathlib import Path
+
+    import pandas as pd
+
+    from models.retrain import record, retrain
+    from models.train import TrainedModel, render_report
+
+    path = Path(args.model or SETTINGS.paths.models / "model.pkl")
+    incumbent = TrainedModel.load(path) if path.exists() else None
+    if incumbent is not None:
+        print(
+            f"Incumbent: {incumbent.backend_name}, trained "
+            f"{pd.Timestamp(incumbent.trained_at_ms, unit='ms', tz='UTC'):%Y-%m-%d %H:%M} UTC "
+            f"on data through "
+            f"{pd.Timestamp(incumbent.train_span[1], unit='ms', tz='UTC'):%Y-%m-%d}, "
+            f"walk-forward AUC {incumbent.mean_val_auc:.4f}"
+        )
+    else:
+        print(f"No incumbent at {path}; this will be the first model.")
+
+    outcome = retrain(
+        coins=_configured_markets(),
+        interval=args.interval,
+        model_path=path,
+        incumbent=incumbent,
+        force=args.force,
+        dry_run=args.dry_run,
+    )
+    if not args.dry_run:
+        record(outcome)
+    print(f"\n{outcome.describe()}")
+    if outcome.model is not None:
+        print()
+        print(render_report(outcome.model))
+    return 0 if outcome.status in {"promoted", "rejected", "skipped"} else 1
 
 
 def cmd_backtest(args: argparse.Namespace) -> int:
@@ -328,6 +413,7 @@ def cmd_paper(args: argparse.Namespace) -> int:
     print(f"  entry        : P(up) >= {args.threshold:.2f} "
           f"(model base rate {trader.generator._base_rate:.2f}); long-only")
     print(f"  activity     : {SETTINGS.strategy.describe()}")
+    print(f"  learning     : {SETTINGS.learning.describe()}")
     print(f"  reports      : {'on' if SETTINGS.report.enabled else 'OFF'} "
           f"-> {SETTINGS.report.recipient} at {SETTINGS.report.schedule_hours}")
     if not service.emailer.configured:
@@ -425,6 +511,30 @@ def build_parser() -> argparse.ArgumentParser:
                        help="do not score the locked test set (keeps it unused)")
     train.add_argument("--output", default=None)
     train.set_defaults(func=cmd_train)
+
+    retrain = sub.add_parser(
+        "retrain",
+        help="refit the deployed model on all stored history, promoting it if it earns it",
+    )
+    retrain.add_argument("--interval", default="1h")
+    retrain.add_argument("--model", default=None)
+    retrain.add_argument("--force", action="store_true",
+                         help="retrain even if little new data has arrived")
+    retrain.add_argument("--dry-run", action="store_true",
+                         help="train and report, but do not replace the live "
+                              "model or touch the history")
+    retrain.set_defaults(func=cmd_retrain)
+
+    scorecard = sub.add_parser(
+        "scorecard",
+        help="mark the live model's recorded predictions against what actually happened",
+    )
+    scorecard.add_argument("--interval", default="1h")
+    scorecard.add_argument("--model", default=None)
+    scorecard.add_argument("--threshold", type=float, default=0.55,
+                           help="the entry bar, for the 'when it said go' line")
+    scorecard.add_argument("--top", type=int, default=15, help="markets to list")
+    scorecard.set_defaults(func=cmd_scorecard)
 
     backtest = sub.add_parser("backtest", help="run the full system over history")
     backtest.add_argument("--coins", nargs="*", default=None)

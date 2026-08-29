@@ -410,6 +410,57 @@ class StrategyConfig:
 
 
 @dataclass(frozen=True)
+class LearningConfig:
+    """How the deployed model is kept current with what has happened since.
+
+    Without this the model is frozen at whatever the first boot trained: it
+    never sees a single bar of the market it is trading, so it can be wrong
+    about the same setup every day and never learn anything from it.
+    Retraining is scheduled on wall-clock time rather than on cycles, for
+    the same reason the idle clock is -- a counter in memory resets on every
+    redeploy.
+    """
+
+    #: Retrain the live model on a schedule. Off means the model is frozen
+    #: at whatever the first boot produced, forever.
+    enabled: bool = _env_bool("RETRAIN_ENABLED", True)
+
+    #: Hours between retrains, measured from the model's own
+    #: ``trained_at_ms``. A restart therefore does not reset the clock, and
+    #: a model that is already stale retrains on the first cycle after boot
+    #: rather than a full period later.
+    every_hours: float = _env_float("RETRAIN_EVERY_HOURS", 24.0)
+
+    #: Do not retrain until at least this many new bars have been stored
+    #: since the model was fitted. Refitting on the same data spends minutes
+    #: of CPU to produce a reseeded copy of the same model. Counted as
+    #: distinct bar timestamps, so the number means "hours of new market"
+    #: whether three markets are being traded or two hundred, and one
+    #: lagging market cannot hold the count down.
+    min_new_bars: int = _env_int("RETRAIN_MIN_NEW_BARS", 12)
+
+    #: A candidate is rejected if its walk-forward AUC is this far below the
+    #: incumbent's. Deliberately loose: at an AUC near 0.50 the difference
+    #: between two models is mostly noise, and fresher data breaks the tie.
+    min_auc_margin: float = _env_float("RETRAIN_MIN_AUC_MARGIN", 0.02)
+
+    @property
+    def every_ms(self) -> int | None:
+        if not self.enabled or self.every_hours <= 0:
+            return None
+        return int(self.every_hours * 3_600_000)
+
+    def describe(self) -> str:
+        if self.every_ms is None:
+            return "retraining OFF - the model stays frozen at its first fit"
+        return (
+            f"retrain every {self.every_hours:g}h on all stored history "
+            f"(needs {self.min_new_bars}+ new bars; a candidate more than "
+            f"{self.min_auc_margin:.2f} AUC below the incumbent is rejected)"
+        )
+
+
+@dataclass(frozen=True)
 class Settings:
     paths: Paths = field(default_factory=Paths)
     hyperliquid: HyperliquidConfig = field(default_factory=HyperliquidConfig)
@@ -417,6 +468,7 @@ class Settings:
     risk: RiskLimits = field(default_factory=resolve_risk_profile)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
+    learning: LearningConfig = field(default_factory=LearningConfig)
     report: ReportConfig = field(default_factory=ReportConfig)
 
     #: Global kill-switch documenting intent. Nothing in this repo may place

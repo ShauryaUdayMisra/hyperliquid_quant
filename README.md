@@ -142,6 +142,17 @@ The live loop reuses the *same* `ModelStrategy` and `MarketView` as the
 backtest. Separate code paths would drift, and the backtest would stop being
 evidence about the live system.
 
+It also keeps learning. Every `RETRAIN_EVERY_HOURS` the trader refits on all
+stored history — including every bar it has since been wrong about — and swaps
+the new model in without a restart, keeping the incumbent if the candidate is
+clearly worse or if its AUC has jumped into leak territory. And it marks its
+own homework: `main.py scorecard` resolves every probability the live system
+ever recorded against what the price actually did. That is the only
+out-of-sample number here that cannot have been tuned, because each prediction
+was written down before its outcome existed. Retraining does not manufacture
+an edge — at a holdout AUC of 0.504 it cannot — but it stops the model being
+frozen at the regime that happened to prevail the day it was first fit.
+
 ---
 
 ## Quick start
@@ -151,12 +162,13 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 .venv/bin/python main.py status            # API reachability + safety checks
 .venv/bin/python main.py prove-accounting  # verify the arithmetic
-.venv/bin/python -m pytest                 # 357 tests
+.venv/bin/python -m pytest                 # 446 tests
 
 .venv/bin/python main.py backfill --days 400 --intervals 1h
 .venv/bin/python main.py verify            # gaps + future timestamps
 .venv/bin/python main.py train --interval 1h
 .venv/bin/python main.py backtest --control
+.venv/bin/python main.py scorecard         # mark the live model's own calls
 ```
 
 Then `main.py paper` for live paper trading, `main.py dashboard` for the web

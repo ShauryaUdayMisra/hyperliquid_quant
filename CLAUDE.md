@@ -32,7 +32,8 @@ data in, simulated fills out, $100,000 of virtual money.
 data/       collection, backfill, Parquet + DuckDB, integrity checks
 features/   106 point-in-time features (momentum, volatility, volume,
             funding, order book, cross-asset, regime)
-models/     labels, dataset splits, walk-forward training, inference
+models/     labels, dataset splits, walk-forward training, inference,
+            scheduled retraining, live scorecard
 strategy/   probability -> position target; baselines for testing
 risk/       hard limits, position sizing, liquidation buffer
 execution/  paper exchange, fill simulation, live loop, state persistence
@@ -53,6 +54,30 @@ same close.
 **Live reuses backtest code.** `execution/paper_trader.py` builds a real
 `MarketView` and calls the same `ModelStrategy.on_bar`. Do not fork this
 logic — divergence would make the backtest stop being evidence about live.
+
+**The model has to keep learning, and it has to be marked.** Trained once at
+first boot, it never sees a bar of the market it trades: the same setup can go
+against it every day and the next prediction is identical to the first.
+`models/retrain.py` refits on all stored history every `RETRAIN_EVERY_HOURS`
+and `PaperTrader._swap_model` puts the result behind the live strategy without
+a restart. The retrain clock is `trained_at_ms`, not a counter, for the same
+reason the idle clock is. Three things it deliberately does *not* do: it never
+changes the question (label config, params and backend are inherited from the
+incumbent, so probabilities keep meaning the same thing), it never reads the
+locked holdout (that would turn a one-shot test set into a tuning set within a
+week), and it never promotes a candidate whose AUC has jumped to leak territory.
+Retraining does not manufacture an edge — at AUC 0.504 refitting the same
+features on more of the same data will not change that. It buys currency with
+the regime, and it turns mistakes into training rows.
+
+`models/scorecard.py` is the other half, and the more important one:
+`main.py scorecard` marks every probability the live system ever recorded
+against what the price actually did. It is the only out-of-sample number in the
+project that cannot have been tuned, because each prediction was written down
+before its outcome existed. Two traps it avoids — a call at 13:00:15 is marked
+against the **12:00** bar (only completed bars are stored, so matching on the
+newest bar *open* would hand the model a price from its own future), and a call
+whose horizon has not elapsed is pending, never scored.
 
 **The activity rules can fight each other.** A forced entry is opened
 *below* the entry threshold by definition, so on the very next bar the same
@@ -94,12 +119,14 @@ plants a deliberate leak to prove the checker works.
 ## Commands
 
 ```bash
-.venv/bin/python -m pytest              # 357 tests (+4 live, run with -m live)
+.venv/bin/python -m pytest              # 445 tests (+4 live, run with -m live)
 .venv/bin/python main.py status         # API reachability + safety checks
 .venv/bin/python main.py prove-accounting
 .venv/bin/python main.py backfill --days 400 --intervals 1h
 .venv/bin/python main.py verify         # gaps, future timestamps
 .venv/bin/python main.py train --interval 1h
+.venv/bin/python main.py retrain           # refit the live model on fresh data
+.venv/bin/python main.py scorecard         # mark the live model's own calls
 .venv/bin/python main.py backtest --control    # --control = shuffled baseline
 .venv/bin/python main.py paper          # live paper trading
 .venv/bin/python main.py report --test-report
@@ -146,6 +173,23 @@ plants a deliberate leak to prove the checker works.
   skipped market decides on the bars it already has.
 - **Backfilling 1m/5m/1h at once triggers 429s.** Keep `CANDLE_INTERVALS=1h`
   in deployment.
+- **Markets are never equal in length; align the bars, not the matrices.**
+  The cross-asset block raises `coins are not aligned` on frames of different
+  lengths, and in real storage they always differ -- one market topped up a
+  minute later, one skipped by a rate limit, one listed last week. That
+  exception took the whole feature build down, which is the "one bad market
+  stops the rest" failure yet again; a scheduled retrain met it every single
+  time. `features.pipeline.align_bars` drops markets with a fraction of the
+  deepest history (rather than truncating everyone to a new listing) and inner
+  joins the rest. It must be applied to *bars*: the live loop and the backtest
+  index a coin's feature frame by the same position they index its bars, so a
+  matrix shorter than its bars would silently score the wrong row.
+- **Freshness is measured from `trained_at_ms`, not `train_span[1]`.** The
+  span ends where the *development* period ends, ~20% short of the data it was
+  built from because the tail is the locked holdout. Measuring from there
+  reports a fifth of the dataset as new on every run, so the "is there anything
+  to learn from" gate can never say no and every cycle refits an identical
+  model.
 - **The cross-asset benchmark (BTC) has no `cross_*_btc_*` values.**
   `build_universe` aligns all coins to a union of columns and fills NaN.
   Without that alignment BTC could never produce a signal at all.
@@ -223,7 +267,7 @@ The two things that were *not* removed, and should not be:
 
 ## Current status
 
-Phases 1-8 of the original brief are built. 357 tests pass.
+Phases 1-8 of the original brief are built. 445 tests pass.
 
 **The model has no demonstrated edge.** On 208 days of real BTC/ETH/SOL
 hourly data:
@@ -259,7 +303,11 @@ and so is the daily P&L boundary — both ends, so the label and the number
 cannot disagree. Everything stored and computed is UTC; this is presentation
 only. `/api/state` reports the live configuration (markets, per-position cap,
 thresholds, hold window) because configuration the reader cannot see is
-configuration they cannot trust.
+configuration they cannot trust. `/api/learning` does the same for the model:
+which one is deciding, when it next refits, every refit it has attempted, and
+the live scorecard. A model that changes itself on a schedule makes a change in
+behaviour indistinguishable from a change in the market unless the page says
+which one moved.
 
 ## Deployment
 

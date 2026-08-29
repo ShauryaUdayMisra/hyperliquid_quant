@@ -14,7 +14,14 @@ One cycle:
 
     top up candles -> rebuild features -> settle funding -> check
     liquidation -> ask the strategy -> execute against the live book ->
-    record everything -> save state
+    record everything -> save state -> retrain if the model is stale
+
+The last step is what stops the model being frozen at whatever the first
+boot fitted. On a schedule it refits on all stored history -- every bar the
+live system has since been wrong about included -- and swaps the result in
+without a restart. :mod:`models.scorecard` is the other half: it marks the
+predictions this loop has already recorded against what the price actually
+did, so "is it learning" is a number rather than a hope.
 
 Everything is persisted each cycle, so a restart resumes rather than
 silently starting a fresh $100k account.
@@ -43,8 +50,10 @@ from data.schemas import parse_l2_book, parse_meta_and_asset_ctxs
 from execution.paper_exchange import PaperExchange
 from execution.simulator import FillSimulator, MarketSnapshot
 from execution.state_store import StateStore
-from features.pipeline import FeatureConfig, build_universe
+from features.pipeline import FeatureConfig, align_bars, build_universe
 from models.predict import SignalGenerator
+from models.retrain import RetrainOutcome, record as record_retrain, retrain
+from models.scorecard import LiveScorecard, load_scorecard
 from models.train import TrainedModel
 from risk.risk_engine import RiskEngine
 from strategy.signals import ModelStrategy
@@ -118,7 +127,9 @@ class PaperTrader:
                 f"no trained model at {model_path}. Run `python main.py train` first; "
                 "the paper trader will not invent a signal."
             )
+        self.model_path = model_path
         self.model: TrainedModel = TrainedModel.load(model_path)
+        self.long_threshold = long_threshold
         self.generator = SignalGenerator(self.model, long_threshold=long_threshold)
 
         self.risk = RiskEngine(self.settings.risk, self.settings.execution)
@@ -131,6 +142,17 @@ class PaperTrader:
         self.state_store = StateStore(self.settings.paths.storage / "paper_account.json")
         restored = self.state_store.load_into(self.exchange)
         self._started_ms = int(restored.get("started_ms", time.time() * 1000))
+
+        # The retrain clock runs from the model's own trained_at_ms, not from
+        # boot. A restart therefore cannot postpone a retrain that is already
+        # due -- on a service that redeploys several times a day, a clock
+        # started at boot would mean the model never refits at all, which is
+        # exactly the counter-versus-timestamp mistake the idle clock made.
+        self.learning = self.settings.learning
+        self._last_retrain_ms = int(
+            restored.get("last_retrain_ms") or self.model.trained_at_ms
+        )
+        self.last_retrain: RetrainOutcome | None = None
 
         # The idle clock is restored, not restarted. Counting flat bars in
         # memory meant every redeploy handed the timer a fresh zero, so on a
@@ -336,6 +358,13 @@ class PaperTrader:
                     "no market has stored bars yet; run a backfill first"
                 )
 
+            # One timestamp grid before any feature is computed. Markets are
+            # topped up market-by-market and a 429 skips one entirely, so
+            # their tails routinely differ in length -- which the cross-asset
+            # block refuses to work with. Aligning the bars rather than the
+            # matrices keeps the positional index below valid for both.
+            bars = align_bars(bars)
+
             # Funding and books follow the surviving bars: a coin dropped
             # above must not reappear here with nothing to attach to.
             matrices = build_universe(
@@ -390,18 +419,123 @@ class PaperTrader:
             )
 
             self._record(result, marks)
-            self.state_store.save(self.exchange, extra={
-                "started_ms": self._started_ms,
-                "idle_since_ms": self.strategy.idle_since_ms,
-            })
+            self.state_store.save(self.exchange, extra=self._state_extra())
             self.cycles += 1
             log.info("cycle %d | %s", self.cycles, result.describe())
+
+            # Last, and deliberately after the cycle has been logged and
+            # persisted: a retrain takes minutes, and nothing about this
+            # cycle should be waiting on it.
+            self._maybe_retrain(now_ms)
             return result
 
         except Exception as exc:  # noqa: BLE001 - a bad cycle must not end the loop
             self.errors += 1
             log.exception("paper trading cycle failed")
             return CycleResult(now_ms, 0.0, 0.0, 0.0, 0.0, 0, 0, 0, error=str(exc))
+
+    # -- learning ----------------------------------------------------------
+
+    def _state_extra(self) -> dict[str, Any]:
+        """Clocks that must survive a restart, saved beside the account."""
+        return {
+            "started_ms": self._started_ms,
+            "idle_since_ms": self.strategy.idle_since_ms,
+            "last_retrain_ms": self._last_retrain_ms,
+            "model_trained_at_ms": self.model.trained_at_ms,
+        }
+
+    def retrain_due(self, now_ms: int) -> bool:
+        every_ms = self.learning.every_ms
+        if every_ms is None:
+            return False
+        return now_ms - self._last_retrain_ms >= every_ms
+
+    def scorecard(self) -> LiveScorecard:
+        """Mark the decisions this trader has already recorded.
+
+        This is the honest out-of-sample number for the deployed model: its
+        own calls, against what the price actually did. Unlike a backtest it
+        cannot have been tuned, because the predictions were written down
+        before the outcome existed.
+        """
+        return load_scorecard(
+            coins=self.coins,
+            interval=self.interval,
+            interval_ms=self.interval_ms,
+            label_config=self.model.label_config,
+            entry_threshold=self.generator.long_threshold,
+            store=self.store,
+        )
+
+    def _maybe_retrain(self, now_ms: int) -> RetrainOutcome | None:
+        """Refit on everything stored, if the model is due. Never raises.
+
+        Run inline rather than on a worker thread. The cycle writes candles
+        and reads them back through the same Parquet store, and a retrain
+        reading the whole history underneath a concurrent write is a data
+        race for no gain: decisions are hourly, so spending a few minutes of
+        that hour learning costs nothing as long as it stays well inside the
+        interval. If it ever does not, the next cycle simply starts late and
+        the delay is visible in the log below.
+        """
+        if not self.retrain_due(now_ms):
+            return None
+        try:
+            card = self.scorecard()
+            log.info("before retraining -- %s", card.describe())
+
+            outcome = retrain(
+                coins=self.coins,
+                interval=self.interval,
+                model_path=self.model_path,
+                incumbent=self.model,
+                settings=self.settings,
+                learning=self.learning,
+                store=self.store,
+            )
+            record_retrain(outcome, store=self.store)
+            self.last_retrain = outcome
+            log.info("%s", outcome.describe())
+
+            if outcome.promoted and outcome.model is not None:
+                self._swap_model(outcome.model)
+
+            # The clock advances on any *completed* attempt, including a
+            # rejection. A candidate that lost to the incumbent would lose
+            # again on the same data an hour later; retrying every cycle
+            # would burn the box for nothing. A "skipped" attempt -- too
+            # little new data -- is cheap and is retried next cycle.
+            if outcome.status != "skipped":
+                self._last_retrain_ms = now_ms
+                self.state_store.save(self.exchange, extra=self._state_extra())
+            return outcome
+        except Exception as exc:  # noqa: BLE001 - learning must not stop trading
+            log.exception("retrain step failed; trading continues on the current model")
+            self._last_retrain_ms = now_ms
+            return RetrainOutcome(
+                ts_ms=now_ms, status="failed", reason=f"{type(exc).__name__}: {exc}"
+            )
+
+    def _swap_model(self, model: TrainedModel) -> None:
+        """Put a newly trained model behind the live strategy, in place.
+
+        The strategy holds the generator, so replacing only ``self.model``
+        would leave every decision still being made by the old one. The
+        entry threshold is carried across unchanged: retraining changes what
+        the model has seen, never how confident it must be to trade.
+        """
+        self.model = model
+        self.generator = SignalGenerator(model, long_threshold=self.long_threshold)
+        self.strategy.generator = self.generator
+        self.strategy._signal_cache = {}
+        log.info(
+            "live model replaced: %s, %d features, trained through %s, "
+            "walk-forward AUC %.4f",
+            model.backend_name, len(model.features),
+            pd.Timestamp(model.train_span[1], unit="ms", tz="UTC"),
+            model.mean_val_auc,
+        )
 
     # -- persistence -------------------------------------------------------
 
@@ -470,6 +604,7 @@ class PaperTrader:
             "paper trader starting | profile=%s | markets=%s | model=%s | cycle=%.0fs",
             self.settings.risk.name, self.coins, self.model.backend_name, cycle_seconds,
         )
+        log.info("learning | %s", self.learning.describe())
 
         results = []
         while not self._stop.is_set():

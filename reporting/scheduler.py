@@ -65,6 +65,37 @@ class ReportService:
             marks.setdefault(position.coin, position.entry_price)
         return marks
 
+    def learning_summary(self) -> dict:
+        """Which model is deciding and how its own calls have turned out.
+
+        Best effort: marking the decision ledger reads every stored bar, and
+        a report that cannot be built is a report that does not get sent. A
+        missing section is a far smaller loss than a missing email.
+        """
+        try:
+            model = self.trader.model
+            every_ms = self.settings.learning.every_ms
+            last = getattr(self.trader, "_last_retrain_ms", None) or model.trained_at_ms
+            outcome = getattr(self.trader, "last_retrain", None)
+            return {
+                "model": {
+                    "backend": model.backend_name,
+                    "question": model.label_config.name,
+                    "features": len(model.features),
+                    "trained_through_ms": model.train_span[1],
+                    "val_auc": model.mean_val_auc,
+                },
+                "retrain": {
+                    "enabled": every_ms is not None,
+                    "next_ms": (last + every_ms) if every_ms else None,
+                    "last_outcome": outcome.describe() if outcome else None,
+                },
+                "scorecard": self.trader.scorecard().describe(),
+            }
+        except Exception as exc:  # noqa: BLE001 - never lose the report over this
+            log.warning("could not summarise the model for the report: %s", exc)
+            return {}
+
     def generate(self, *, now_ms: int | None = None) -> ReportOutcome:
         marks = self.current_marks()
         data = self.builder.build(
@@ -72,6 +103,7 @@ class ReportService:
             marks=marks,
             risk_engine=self.trader.risk,
             latest_decisions=self.trader.strategy.latest_by_coin(),
+            learning=self.learning_summary(),
             now_ms=now_ms or int(time.time() * 1000),
         )
         subject = subject_line(data.equity, data.starting_capital, data.pnl_window)

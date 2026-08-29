@@ -106,8 +106,15 @@ def _local_midnight_ms(now_ms: int) -> int:
     return int(midnight.timestamp() * 1000)
 
 
+def _trade_interval() -> str:
+    """The bar the trader decides on. start.sh passes it as an argument, and
+    the dashboard cannot see argv -- so read the same variable it does."""
+    name = os.environ.get("TRADE_INTERVAL", "1h")
+    return name if name in INTERVAL_MS else "1h"
+
+
 def _interval_ms() -> int:
-    return INTERVAL_MS.get(os.environ.get("TRADE_INTERVAL", "1h"), 3_600_000)
+    return INTERVAL_MS[_trade_interval()]
 
 
 def _next_decision_ms(after_ms: int) -> int:
@@ -403,6 +410,113 @@ def api_decisions(limit: int = 40) -> JSONResponse:
 
 
 # --------------------------------------------------------------------------
+# What it has learned
+# --------------------------------------------------------------------------
+
+#: The live scorecard reads every stored bar to resolve every recorded call,
+#: which is far too much work to repeat for each viewer every 30 seconds --
+#: and pointless, because it can only change when a bar closes.
+_SCORECARD_CACHE: dict[str, object] = {"ts_ms": 0, "value": None}
+_SCORECARD_TTL_MS = 5 * 60_000
+
+
+def _model_path() -> Path:
+    """Where the live model actually is.
+
+    Railway attaches one volume per service, so the artefact lives beside
+    the market data under the mount rather than in the image's models/
+    directory. MODEL_PATH is what start.sh passes the trader; fall back to
+    both conventional locations so a local run finds it too.
+    """
+    configured = os.environ.get("MODEL_PATH")
+    candidates = [Path(configured)] if configured else []
+    candidates += [SETTINGS.paths.storage / "model.pkl", SETTINGS.paths.models / "model.pkl"]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[-1]
+
+
+def _cached_scorecard(model) -> dict:
+    now = _now_ms()
+    cached = _SCORECARD_CACHE["value"]
+    if cached is not None and now - int(_SCORECARD_CACHE["ts_ms"]) < _SCORECARD_TTL_MS:
+        return cached  # type: ignore[return-value]
+
+    from models.scorecard import load_scorecard
+
+    try:
+        card = load_scorecard(
+            coins=_configured_markets(),
+            interval=_trade_interval(),
+            interval_ms=_interval_ms(),
+            label_config=model.label_config if model else None,
+            entry_threshold=_signal_threshold(),
+            store=_store(),
+        ).to_dict()
+    except Exception as exc:  # noqa: BLE001 - an empty panel beats a 500
+        log.warning("live scorecard failed: %s", exc)
+        card = {}
+    _SCORECARD_CACHE.update(ts_ms=now, value=card)
+    return card
+
+
+@app.get("/api/learning", dependencies=[Depends(require_auth)])
+def api_learning() -> JSONResponse:
+    """The model behind the decisions, how it has actually done, and when it
+    next refits.
+
+    Configuration the reader cannot see is configuration they cannot trust,
+    and that goes double for a model that changes itself on a schedule: a
+    shift in behaviour is otherwise indistinguishable from a shift in the
+    market.
+    """
+    model = None
+    try:
+        from models.train import TrainedModel
+
+        path = _model_path()
+        if path.exists():
+            model = TrainedModel.load(path)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not read the live model: %s", exc)
+
+    _, extra = _load_account_and_extra()
+    every_ms = SETTINGS.learning.every_ms
+    last_ms = extra.get("last_retrain_ms") or (model.trained_at_ms if model else None)
+
+    history = _records(
+        _query("SELECT * FROM retrains ORDER BY ts_ms DESC LIMIT 12")
+    ) if _store().has_data("retrains") else []
+
+    return JSONResponse({
+        "model": None if model is None else {
+            "backend": model.backend_name,
+            "question": model.label_config.name,
+            "features": len(model.features),
+            "trained_at_ms": model.trained_at_ms,
+            "trained_through_ms": model.train_span[1],
+            "val_auc": _finite(model.mean_val_auc),
+            "log_loss_lift": _finite(model.mean_log_loss_lift),
+        },
+        "retrain": {
+            "enabled": every_ms is not None,
+            "every_hours": SETTINGS.learning.every_hours,
+            "describe": SETTINGS.learning.describe(),
+            "last_ms": last_ms,
+            "next_ms": (last_ms + every_ms) if (every_ms and last_ms) else None,
+            "history": history,
+        },
+        "scorecard": _cached_scorecard(model),
+    })
+
+
+def _finite(value: float) -> float | None:
+    """NaN is a perfectly ordinary metric here and is not JSON."""
+    return float(value) if value == value and abs(value) != float("inf") else None
+
+
+# --------------------------------------------------------------------------
 
 @app.get("/health")
 def health() -> dict[str, str]:
@@ -483,6 +597,13 @@ INDEX_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <h2>Current reasoning <span class="muted" id="rwin"></span></h2>
 <div id="reasoning"></div>
 
+<h2>What it has learned</h2>
+<p class="muted" id="lsub"></p>
+<div class="pnl" id="lcards"></div>
+<div class="scroll"><table id="retrains"><thead><tr><th>Time</th><th>Outcome</th>
+<th>Rows</th><th>Candidate</th><th>Incumbent</th><th>Why</th>
+</tr></thead><tbody></tbody></table></div>
+
 <footer>Simulated paper trading. No real capital at risk. Not financial advice.<br>
 <span id="updated"></span></footer>
 </div><script>
@@ -513,13 +634,64 @@ function pnlCard(label,value,sub){
     <div class="value ${cls(value)}">${sgn(value)}</div><div class="sub">${sub||''}</div></div>`;
 }
 
+// The model refits itself on a schedule, so a change in behaviour is
+// otherwise indistinguishable from a change in the market. Show which model
+// is deciding, how its own past calls actually turned out, and when it next
+// refits.
+function statCard(label,value,sub){
+  return `<div class="card"><div class="label">${label}</div>
+    <div class="value" style="font-size:20px">${value}</div>
+    <div class="sub">${sub||''}</div></div>`;
+}
+
+function renderLearning(l){
+  const m=l.model, rt=l.retrain||{}, sc=l.scorecard||{}, mx=sc.metrics||{};
+  const bits=[];
+  if(m){
+    bits.push(`${m.backend} · ${m.features} features · asks ${m.question}`);
+    bits.push(`fitted on data through ${tm(m.trained_through_ms)}`);
+    if(m.val_auc!=null) bits.push(`walk-forward AUC ${m.val_auc.toFixed(4)}`);
+  } else {
+    bits.push('No model artefact could be read.');
+  }
+  if(rt.enabled && rt.next_ms) bits.push(`next refit ${tm(rt.next_ms)} ${tzLabel()}`);
+  else if(!rt.enabled) bits.push('retraining is OFF — this model is frozen');
+  document.getElementById('lsub').textContent = bits.join(' · ');
+
+  const cards=[];
+  const resolved=sc.resolved||0;
+  cards.push(statCard('Calls marked', resolved.toLocaleString(),
+    (sc.pending||0).toLocaleString()+' still inside their horizon'));
+  cards.push(statCard('Live AUC',
+    mx.auc!=null?mx.auc.toFixed(4):'—',
+    sc.has_verdict?'0.50 is a coin flip':'too few calls to mean anything yet'));
+  const acted=sc.acted||{};
+  cards.push(statCard('When it said go',
+    acted.hit_rate!=null?(acted.hit_rate*100).toFixed(1)+'%':'—',
+    acted.rows?`${acted.rows.toLocaleString()} calls above the entry bar · `
+      +`base rate ${(mx.base_rate*100).toFixed(1)}%`
+      :'no resolved call cleared the entry bar'));
+  document.getElementById('lcards').innerHTML=cards.join('');
+
+  const hist=rt.history||[];
+  document.querySelector('#retrains tbody').innerHTML = hist.length
+    ? hist.map(h=>`<tr><td>${tm(h.ts_ms)}</td>
+      <td class="${h.status==='promoted'?'up':(h.status==='failed'?'down':'muted')}">${h.status}</td>
+      <td>${Number(h.rows||0).toLocaleString()}</td>
+      <td>${h.candidate_auc!=null?Number(h.candidate_auc).toFixed(4):'—'}</td>
+      <td>${h.incumbent_auc!=null?Number(h.incumbent_auc).toFixed(4):'—'}</td>
+      <td class="muted">${h.reason||''}</td></tr>`).join('')
+    : '<tr><td colspan="6" class="muted">No refit has run yet.</td></tr>';
+}
+
 async function load(){
-  const [s,p,e,a,r]=await Promise.all([
+  const [s,p,e,a,r,l]=await Promise.all([
     fetch('/api/state').then(r=>r.json()),
     fetch('/api/pnl').then(r=>r.json()),
     fetch('/api/equity').then(r=>r.json()),
     fetch('/api/activity').then(r=>r.json()),
-    fetch('/api/reasoning').then(r=>r.json())]);
+    fetch('/api/reasoning').then(r=>r.json()),
+    fetch('/api/learning').then(r=>r.json())]);
 
   TZ = s.timezone || 'UTC';
 
@@ -626,6 +798,8 @@ async function load(){
       <div class="muted" style="margin-top:8px;font-size:12px">Risk: ${m.risk_summary||'—'}</div>
       </div>`).join('')
     : '<p class="muted">No decisions recorded yet. The trader writes one per bar close.</p>';
+
+  renderLearning(l);
 
   document.getElementById('updated').textContent =
     'Updated '+hm(Date.now())+' '+tzLabel()+' · refreshes every 30s';

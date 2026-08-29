@@ -144,3 +144,29 @@ def test_the_page_reports_the_settings_it_is_running(monkeypatch) -> None:
         assert key in body, f"/api/state does not expose {key}"
     for key in ("min_hold_hours", "max_hold_hours", "max_idle_hours"):
         assert key in body["activity"], f"activity does not expose {key}"
+
+
+def test_the_learning_panel_says_which_model_is_deciding(client):
+    """A model that refits itself on a schedule makes a change in behaviour
+    indistinguishable from a change in the market -- unless the page says
+    which model is running and when it next changes."""
+    http, _ = client
+    body = http.get("/api/learning", auth=("admin", "s3cret")).json()
+
+    assert set(body) == {"model", "retrain", "scorecard"}
+    assert "enabled" in body["retrain"]
+    assert "describe" in body["retrain"]
+    assert "resolved" in body["scorecard"]
+
+
+def test_the_learning_endpoint_is_behind_the_password(client):
+    http, _ = client
+    assert http.get("/api/learning").status_code == 401
+
+
+def test_a_scorecard_with_no_resolved_calls_still_renders(client):
+    """NaN is not JSON, and one unserialisable value blanks every panel."""
+    http, _ = client
+    response = http.get("/api/learning", auth=("admin", "s3cret"))
+    assert response.status_code == 200
+    assert "NaN" not in response.text

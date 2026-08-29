@@ -122,6 +122,11 @@ class ReportData:
     risk_status: dict[str, Any] = field(default_factory=dict)
     vetoes: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    #: Which model is deciding, how its own past calls turned out, and when
+    #: it next refits. A model that retrains itself on a schedule makes a
+    #: change in behaviour indistinguishable from a change in the market
+    #: unless the report says which one changed.
+    learning: dict[str, Any] = field(default_factory=dict)
 
     @property
     def total_return(self) -> float:
@@ -208,6 +213,7 @@ class ReportBuilder:
         marks: dict[str, float],
         risk_engine: RiskEngine | None = None,
         latest_decisions: dict[str, Any] | None = None,
+        learning: dict[str, Any] | None = None,
         now_ms: int | None = None,
     ) -> ReportData:
         now_ms = now_ms or int(pd.Timestamp.now("UTC").timestamp() * 1000)
@@ -236,6 +242,7 @@ class ReportBuilder:
         data.positions = self._positions(exchange, marks, equity)
         data.trades = self._trades(exchange, window_start)
         data.plans = self._plans(latest_decisions or {}, exchange, marks)
+        data.learning = learning or {}
 
         if risk_engine is not None:
             state = risk_engine.account_state(
@@ -374,6 +381,46 @@ class ReportBuilder:
 # Rendering
 # --------------------------------------------------------------------------
 
+def learning_lines(learning: dict[str, Any]) -> list[str]:
+    """The model paragraph, identical in the text and HTML reports.
+
+    Written once because two renderings of the same facts drift, and the
+    first thing to drift would be whichever one nobody reads.
+    """
+    lines: list[str] = []
+    model = learning.get("model")
+    if model:
+        lines.append(
+            f"Deciding: {model.get('backend', '?')} on {model.get('features', 0)} "
+            f"features, asking {model.get('question', '?')}"
+        )
+        through = model.get("trained_through_ms")
+        auc = model.get("val_auc")
+        detail = f"Fitted on data through {pd.Timestamp(through, unit='ms', tz='UTC'):%Y-%m-%d}" \
+            if through else "Training span unknown"
+        if auc is not None:
+            detail += f", walk-forward AUC {auc:.4f} (0.50 is a coin flip)"
+        lines.append(detail)
+    else:
+        lines.append("No model artefact could be read.")
+
+    retrain = learning.get("retrain") or {}
+    if not retrain.get("enabled"):
+        lines.append("Retraining is OFF - this model is frozen at its first fit.")
+    elif retrain.get("next_ms"):
+        lines.append(
+            f"Next refit on all stored history at "
+            f"{pd.Timestamp(retrain['next_ms'], unit='ms', tz='UTC'):%Y-%m-%d %H:%M} UTC."
+        )
+    if retrain.get("last_outcome"):
+        lines.append(f"Last refit: {retrain['last_outcome']}")
+
+    for line in (learning.get("scorecard") or "").splitlines():
+        if line.strip():
+            lines.append(line.strip())
+    return lines
+
+
 def render_text(data: ReportData) -> str:
     """Plain-text fallback. Must contain everything the HTML does."""
     stamp = pd.Timestamp(data.generated_ms, unit="ms", tz="UTC")
@@ -457,6 +504,11 @@ def render_text(data: ReportData) -> str:
             lines.append(f"  TRADING HALTED: {status['halted']}")
     lines.append(f"  risk vetoes this window: {len(data.vetoes)}")
     lines += [f"    {v}" for v in data.vetoes[:10]]
+
+    if data.learning:
+        lines += ["", "THE MODEL, AND HOW IT IS DOING"] + [
+            f"  {line}" for line in learning_lines(data.learning)
+        ]
 
     if data.notes:
         lines += ["", "NOTES"] + [f"  {n}" for n in data.notes]
@@ -607,6 +659,14 @@ def render_html(data: ReportData) -> str:
         + "</div>"
     ) if data.notes else ""
 
+    learning_html = (
+        '<h2 style="font-size:16px;margin:24px 0 8px">The model, and how it is doing</h2>'
+        '<div style="border:1px solid #e6e8eb;border-radius:8px;padding:12px;'
+        'background:#fafbfc;font-size:13px;color:#344054">'
+        + "".join(f"<div>{esc(line)}</div>" for line in learning_lines(data.learning))
+        + "</div>"
+    ) if data.learning else ""
+
     return f"""<div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;
      max-width:760px;margin:0 auto;padding:24px;color:#101828;background:#ffffff">
   <div style="border-bottom:3px solid {accent};padding-bottom:16px;margin-bottom:20px">
@@ -641,6 +701,7 @@ def render_html(data: ReportData) -> str:
   <h2 style="font-size:16px;margin:24px 0 8px">Risk status</h2>
   {risk_html}
   {veto_html}
+  {learning_html}
 
   <p style="margin-top:28px;padding-top:16px;border-top:1px solid #e6e8eb;
      color:#667085;font-size:12px">{DISCLAIMER}</p>
