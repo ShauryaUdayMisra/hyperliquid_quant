@@ -170,3 +170,126 @@ def test_a_scorecard_with_no_resolved_calls_still_renders(client):
     response = http.get("/api/learning", auth=("admin", "s3cret"))
     assert response.status_code == 200
     assert "NaN" not in response.text
+
+
+# ==========================================================================
+# The page must survive a broken panel
+# ==========================================================================
+
+#: Minimal but realistically-shaped responses for every API the page calls.
+_FAKE_API = {
+    "/api/state": {
+        "timezone": "UTC", "profile": "aggressive", "max_leverage": 10,
+        "max_positions": 20, "closed_trades": 3, "fills": 9, "liquidations": 0,
+        "markets": ["BTC", "ETH"], "max_position_usd": 10000,
+        "signal_threshold": 0.4, "activity": {"next_decision_ms": 1767225600000},
+        "positions": [], "fees": 1.0, "slippage": 2.0, "funding": 0.5,
+        "bankrupt": False,
+    },
+    "/api/pnl": {
+        "readings": 40, "equity": 99000.0, "starting_capital": 100000.0,
+        "lifetime": -1000.0, "lifetime_pct": -0.01, "day": -10.0, "hour": -1.0,
+    },
+    "/api/equity": {"points": []},
+    "/api/activity": {"fills": [], "trades": []},
+    "/api/reasoning": {"window_hours": 6, "markets": []},
+    "/api/learning": {"model": None, "retrain": {"enabled": True}, "scorecard": {}},
+}
+
+
+def _run_page_script(broken: str | None = None) -> dict:
+    """Execute the dashboard's script under node with a stubbed DOM.
+
+    ``broken`` names an endpoint that answers 500. Returns what the script
+    wrote into each element, so a test can assert on what the reader would
+    actually see.
+    """
+    import json as json_module
+    import re
+    import shutil
+    import subprocess
+
+    import pytest
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed; cannot run the page script")
+
+    import dashboard.app as app_module
+
+    scripts = re.findall(r"<script[^>]*>(.*?)</script>", app_module.INDEX_HTML, re.S)
+    prelude = f"""
+const RESPONSES = {json_module.dumps(_FAKE_API)};
+const BROKEN = {json_module.dumps(broken)};
+const RECORDED = {{}};
+function element(key){{
+  return {{
+    set textContent(v){{ RECORDED[key] = String(v); }},
+    set innerHTML(v){{ RECORDED[key] = String(v); }},
+    get textContent(){{ return RECORDED[key] || ''; }},
+  }};
+}}
+globalThis.document = {{
+  getElementById: id => element(id),
+  querySelector: sel => element(sel),
+}};
+globalThis.fetch = async (url) => {{
+  if (url === BROKEN) return {{ ok: false, status: 500,
+    json: async () => {{ throw new Error('not json'); }} }};
+  return {{ ok: true, status: 200, json: async () => RESPONSES[url] }};
+}};
+globalThis.setInterval = () => 0;
+"""
+    epilogue = """
+setTimeout(() => {
+  console.log('@@RESULT@@' + JSON.stringify({recorded: RECORDED, failed: FAILED}));
+}, 100);
+"""
+    result = subprocess.run(
+        [node, "--input-type=module", "-e", prelude + "\n".join(scripts) + epilogue],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert "@@RESULT@@" in result.stdout, (
+        f"the page script did not finish:\n{result.stdout}\n{result.stderr}"
+    )
+    return json_module.loads(result.stdout.split("@@RESULT@@")[1].splitlines()[0])
+
+
+def test_the_page_renders_when_every_api_answers():
+    out = _run_page_script()
+    assert out["failed"] == []
+    assert "aggressive" in out["recorded"]["sub"]
+    assert out["recorded"]["pnl"], "the P&L cards never rendered"
+
+
+def test_one_broken_endpoint_does_not_blank_the_whole_page():
+    """This is exactly how the dashboard went blank.
+
+    Every panel is rendered by one script from one Promise.all, and
+    Promise.all rejects the moment any member does -- so a single 500 on the
+    newest API left all six panels empty while the page itself still
+    returned 200. The failure looks like a data problem and is not one.
+    """
+    out = _run_page_script(broken="/api/learning")
+
+    assert "aggressive" in out["recorded"]["sub"], "a broken panel blanked the page"
+    assert out["recorded"]["pnl"], "the P&L cards were lost to an unrelated failure"
+    assert out["recorded"]["#pos tbody"], "the positions table was lost"
+
+
+def test_a_panel_that_fails_says_so_instead_of_going_quiet():
+    """A silently missing panel reads as 'nothing is happening', which is a
+    different and much more misleading statement than 'this did not load'."""
+    out = _run_page_script(broken="/api/learning")
+
+    assert "/api/learning" in out["failed"]
+    assert "could not load" in out["recorded"]["banner"]
+    assert "/api/learning" in out["recorded"]["banner"]
+
+
+def test_the_account_panel_failing_also_leaves_the_rest_standing():
+    """The state endpoint feeds the most panels, so it is the worst case."""
+    out = _run_page_script(broken="/api/state")
+
+    assert "/api/state" in out["failed"]
+    assert out["recorded"]["updated"], "the page never finished rendering"

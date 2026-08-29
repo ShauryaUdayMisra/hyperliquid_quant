@@ -59,16 +59,21 @@ def _json_safe(value: Any) -> Any:
     """
     if isinstance(value, pd.DataFrame):
         return [_json_safe(record) for record in value.to_dict("records")]
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
     if isinstance(value, dict):
         return {str(k): _json_safe(v) for k, v in value.items()}
     if isinstance(value, pd.Interval):
         return f"{value.left:.3f}-{value.right:.3f}"
-    if isinstance(value, (np.integer, int)) and not isinstance(value, bool):
+    # Bools first: a Python bool is an int, and numpy 2 renamed np.bool_ so
+    # its type name prints as plain "bool" -- which made the resulting
+    # TypeError read as though json could not serialise a builtin.
+    if isinstance(value, (np.bool_, bool)):
+        return bool(value)
+    if isinstance(value, (np.integer, int)):
         return int(value)
     if isinstance(value, (np.floating, float)):
         return float(value) if np.isfinite(value) else None
-    if isinstance(value, (np.bool_, bool)):
-        return bool(value)
     if value is None or isinstance(value, str):
         return value
     return str(value)
@@ -99,8 +104,16 @@ class LiveScorecard:
 
     @property
     def has_verdict(self) -> bool:
-        """Enough resolved rows for the numbers to mean anything at all."""
-        return self.resolved >= 200 and np.isfinite(self.auc)
+        """Enough resolved rows for the numbers to mean anything at all.
+
+        Cast, not merely computed. ``np.isfinite`` returns a numpy bool, and
+        ``and`` yields its second operand when the first is true -- so this
+        returned a real Python False for the first 199 calls and a
+        numpy.bool_ from the 200th onward. json cannot encode that, which is
+        precisely the kind of bug that only appears once the system has been
+        running for a while.
+        """
+        return bool(self.resolved >= 200 and np.isfinite(self.auc))
 
     def describe(self) -> str:
         if not self.resolved:
@@ -163,7 +176,10 @@ class LiveScorecard:
         dashboard -- so a single unserialisable value blanks every panel
         while the page and all its APIs still answer 200.
         """
-        return {
+        # Every field goes through the coercion, including the ones that
+        # look obviously safe. Trusting individual fields is what let a
+        # numpy bool reach json and 500 the endpoint.
+        return _json_safe({
             "label_question": self.label_question,
             "entry_threshold": self.entry_threshold,
             "resolved": self.resolved,
@@ -172,11 +188,11 @@ class LiveScorecard:
             "first_ts_ms": self.first_ts_ms,
             "last_ts_ms": self.last_ts_ms,
             "has_verdict": self.has_verdict,
-            "metrics": _json_safe(self.metrics),
-            "acted": _json_safe(self.acted),
-            "calibration": _json_safe(self.calibration),
-            "by_coin": _json_safe(self.by_coin),
-        }
+            "metrics": self.metrics,
+            "acted": self.acted,
+            "calibration": self.calibration,
+            "by_coin": self.by_coin,
+        })
 
 
 def _resolve(

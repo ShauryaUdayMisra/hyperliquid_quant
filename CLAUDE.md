@@ -119,7 +119,7 @@ plants a deliberate leak to prove the checker works.
 ## Commands
 
 ```bash
-.venv/bin/python -m pytest              # 445 tests (+4 live, run with -m live)
+.venv/bin/python -m pytest              # 451 tests (+4 live, run with -m live)
 .venv/bin/python main.py status         # API reachability + safety checks
 .venv/bin/python main.py prove-accounting
 .venv/bin/python main.py backfill --days 400 --intervals 1h
@@ -220,6 +220,31 @@ plants a deliberate leak to prove the checker works.
   redeclared `const` did exactly this. `tests/test_dashboard.py` now runs
   `node --check` over the page script; it skips where node is absent, so run
   the suite locally before trusting a dashboard change.
+- **A syntax check is not enough: the page must survive a broken panel.**
+  Every fetch used to sit in one `Promise.all`, which rejects the moment any
+  member does — so one endpoint returning 500 blanked all six panels, with
+  the page and the other five APIs still answering 200. Identical symptom to
+  the syntax error above, different cause, and `node --check` cannot see it.
+  Endpoints are now fetched through `get(url, fallback)`, which never
+  rejects, each render runs inside `safely(...)`, and whatever failed is
+  named in the banner — a silently missing panel reads as "nothing is
+  happening", which is a different and far more misleading claim than "this
+  did not load". `tests/test_dashboard.py` executes the real page script
+  under node with a stubbed DOM and a deliberately failing endpoint; that
+  test fails against the old code, which is the only reason to trust it.
+  **Adding a new panel means adding it to `get(...)`, never to a bare
+  `fetch` — one new API must not be able to take the other five down.**
+- **numpy scalars are not JSON, and `and` returns its second operand.**
+  `has_verdict` was `resolved >= 200 and np.isfinite(auc)`. Under 200 rows
+  the `and` short-circuits to a Python `False` and serialises fine; from the
+  200th row on it yields a `numpy.bool_` and `/api/learning` began returning
+  500 — days after deploy, with the tests passing, because every test used a
+  handful of rows. numpy 2 also renamed `np.bool_`, so the error reads
+  `Object of type bool is not JSON serializable`, which sounds impossible.
+  Anything crossing the JSON boundary goes through
+  `models.scorecard._json_safe` as a whole payload, never field by field,
+  and bools are checked before ints there because a Python bool *is* an int.
+  Test JSON paths at a realistic sample size, not with three rows.
 - **Never let label columns reach the feature list.** `label`,
   `forward_return` and `label_known` are excluded in two independent places.
   A missing exclusion once produced a perfect AUC 1.0000.
@@ -267,7 +292,7 @@ The two things that were *not* removed, and should not be:
 
 ## Current status
 
-Phases 1-8 of the original brief are built. 445 tests pass.
+Phases 1-8 of the original brief are built. 451 tests pass.
 
 **The model has no demonstrated edge.** On 208 days of real BTC/ETH/SOL
 hourly data:

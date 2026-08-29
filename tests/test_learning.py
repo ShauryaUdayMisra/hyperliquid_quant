@@ -24,7 +24,7 @@ from models.retrain import (
     new_labelled_rows,
     save_atomically,
 )
-from models.scorecard import score_decisions
+from models.scorecard import LiveScorecard, score_decisions
 from models.train import FoldResult, TrainedModel
 
 HOUR = INTERVAL_MS["1h"]
@@ -140,6 +140,27 @@ def test_an_empty_ledger_reports_nothing_rather_than_raising() -> None:
     )
     assert card.resolved == 0
     assert "nothing resolved yet" in card.describe()
+
+
+def test_a_scorecard_with_a_real_sample_still_serialises() -> None:
+    """The bug this test exists for only appears after 200 resolved calls.
+
+    has_verdict was `resolved >= 200 and np.isfinite(auc)`. Below 200 the
+    `and` short-circuits and yields a Python False; at 200 it yields the
+    second operand, which is a numpy bool -- and json cannot encode that.
+    So the endpoint served fine for days and then began returning 500,
+    which blanked the whole dashboard. Any test using a handful of rows
+    would have passed against the broken code, as mine did.
+    """
+    import json
+
+    card = LiveScorecard(label_question="q", entry_threshold=0.4, resolved=250)
+    card.metrics = {"auc": 0.51, "brier": float("nan"), "rows": np.int64(250)}
+    card.acted = {"rows": np.int64(9), "hit_rate": np.float64(0.33)}
+
+    assert card.has_verdict is True
+    assert type(card.has_verdict) is bool, "a numpy bool cannot be serialised"
+    json.dumps(card.to_dict(), allow_nan=False)
 
 
 def test_the_scorecard_survives_json_serialisation_for_the_dashboard() -> None:

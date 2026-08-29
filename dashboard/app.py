@@ -684,14 +684,42 @@ function renderLearning(l){
     : '<tr><td colspan="6" class="muted">No refit has run yet.</td></tr>';
 }
 
+// One failing endpoint must never blank the page. Promise.all rejects as
+// soon as any member does, so a single 500 on any one API left every panel
+// empty while the page itself still returned 200 -- the same "one bad
+// component stops the rest" failure this system keeps having, moved into
+// the browser. Each fetch now resolves to a usable fallback instead of
+// rejecting, and says so out loud rather than failing silently.
+const FAILED=[];
+async function get(url, fallback){
+  try{
+    const res=await fetch(url);
+    if(!res.ok) throw new Error(url+' returned '+res.status);
+    return await res.json();
+  }catch(err){
+    console.error(err);
+    FAILED.push(url);
+    return fallback;
+  }
+}
+
+// Likewise for rendering: a panel that throws on unexpected data must not
+// take the panels after it down with it.
+function safely(name, fn){
+  try{ fn(); }
+  catch(err){ console.error(name, err); FAILED.push(name); }
+}
+
 async function load(){
+  FAILED.length=0;
   const [s,p,e,a,r,l]=await Promise.all([
-    fetch('/api/state').then(r=>r.json()),
-    fetch('/api/pnl').then(r=>r.json()),
-    fetch('/api/equity').then(r=>r.json()),
-    fetch('/api/activity').then(r=>r.json()),
-    fetch('/api/reasoning').then(r=>r.json()),
-    fetch('/api/learning').then(r=>r.json())]);
+    get('/api/state',{positions:[],markets:[],activity:{},closed_trades:0,fills:0,
+                      liquidations:0,fees:0,slippage:0,funding:0}),
+    get('/api/pnl',{readings:0}),
+    get('/api/equity',{points:[]}),
+    get('/api/activity',{fills:[],trades:[]}),
+    get('/api/reasoning',{markets:[]}),
+    get('/api/learning',{})]);
 
   TZ = s.timezone || 'UTC';
 
@@ -731,6 +759,8 @@ async function load(){
   const notes=[];
   if(s.bankrupt) notes.push('<b>The account has been wiped out.</b> Trading has stopped.');
   if(p.readings<2) notes.push('Only just started — hourly and daily P&L need more readings.');
+  if(FAILED.length) notes.push('<b>Some panels could not load:</b> '+FAILED.join(', ')
+    +'. Everything else on this page is current. Check the service logs.');
   document.getElementById('banner').innerHTML =
     notes.map(n=>`<div class="banner">${n}</div>`).join('');
 
@@ -799,7 +829,7 @@ async function load(){
       </div>`).join('')
     : '<p class="muted">No decisions recorded yet. The trader writes one per bar close.</p>';
 
-  renderLearning(l);
+  safely('learning panel', ()=>renderLearning(l));
 
   document.getElementById('updated').textContent =
     'Updated '+hm(Date.now())+' '+tzLabel()+' · refreshes every 30s';
