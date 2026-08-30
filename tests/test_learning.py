@@ -618,3 +618,54 @@ def test_a_label_that_does_not_clear_costs_is_a_question_worth_refusing() -> Non
     # The configured one leaves most of the move on the table for the trader.
     assert SETTINGS.label.threshold > round_trip
     assert round_trip / SETTINGS.label.threshold < 0.5
+
+
+def test_a_changed_question_is_not_judged_against_the_old_one() -> None:
+    """An AUC is only comparable to another AUC on the same question.
+
+    Live, a candidate on the new 24-bar label scored 0.5216 and was rejected
+    for sitting below an incumbent's 0.5455 on the old 4-bar one -- a
+    comparison between being good at two different things. It pinned the
+    deployed model to the retired label permanently, because every future
+    candidate would lose the same comparison, and it rejected the long side
+    while promoting the short side, leaving the two answering different
+    questions.
+    """
+    from models.labels import LabelConfig
+
+    incumbent = fake_model(0.5455)
+    incumbent.label_config = LabelConfig(horizon_bars=4, threshold=0.003)
+    candidate = fake_model(0.5216)
+    candidate.label_config = LabelConfig(horizon_bars=24, threshold=0.010)
+
+    promote, reason = decide_promotion(candidate, incumbent, min_auc_margin=0.02)
+    assert promote
+    assert "not a comparator" in reason
+
+
+def test_the_same_question_is_still_judged_on_its_merits() -> None:
+    """The escape hatch above must not swallow the ordinary comparison."""
+    from models.labels import LabelConfig
+
+    same = LabelConfig(horizon_bars=24, threshold=0.010)
+    incumbent, candidate = fake_model(0.5455), fake_model(0.5216)
+    incumbent.label_config = candidate.label_config = same
+
+    promote, reason = decide_promotion(candidate, incumbent, min_auc_margin=0.02)
+    assert not promote
+    assert "below the incumbent" in reason
+
+
+def test_a_leak_shaped_candidate_is_refused_even_on_a_new_question() -> None:
+    """Changing the label must not become a way to wave a broken model
+    through: the plausibility check runs before the comparison."""
+    from models.labels import LabelConfig
+
+    incumbent = fake_model(0.5455)
+    incumbent.label_config = LabelConfig(horizon_bars=4, threshold=0.003)
+    candidate = fake_model(0.92)
+    candidate.label_config = LabelConfig(horizon_bars=24, threshold=0.010)
+
+    promote, reason = decide_promotion(candidate, incumbent, min_auc_margin=0.02)
+    assert not promote
+    assert "leak" in reason

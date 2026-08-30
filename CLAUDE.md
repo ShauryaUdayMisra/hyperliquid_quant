@@ -87,6 +87,18 @@ P&L of +$3,232 wiped out by $15,881 of execution. Liquidity comes from
 volume that has not arrived would put the largest positions on exactly the
 busiest bars.
 
+**An AUC only compares to an AUC on the same question.** The promotion gate
+rejects a candidate that is materially worse than the incumbent — but when
+the *label* changes, the incumbent scores well on a question nobody is
+asking any more. Comparing them rejected the new model for being worse at
+something it was never trained to do, which pinned the deployed model to the
+retired label permanently (every future candidate loses the same
+comparison), and it rejected the long side while promoting the short side,
+leaving the two answering different questions. `decide_promotion` now skips
+the comparison outright when the label differs. The plausibility check still
+runs first, so changing the label is not a way to wave a leak-shaped model
+through.
+
 **A label has to clear what it costs to trade it.** `LabelSettings`
 (`LABEL_HORIZON_BARS`, `LABEL_THRESHOLD`) is configuration, and
 `ExecutionConfig.round_trip_cost()` is the floor it must clear: two taker
@@ -195,7 +207,7 @@ plants a deliberate leak to prove the checker works.
 ## Commands
 
 ```bash
-.venv/bin/python -m pytest              # 473 tests (+4 live, run with -m live)
+.venv/bin/python -m pytest              # 476 tests (+4 live, run with -m live)
 .venv/bin/python main.py status         # API reachability + safety checks
 .venv/bin/python main.py prove-accounting
 .venv/bin/python main.py backfill --days 400 --intervals 1h
@@ -372,7 +384,7 @@ The two things that were *not* removed, and should not be:
 
 ## Current status
 
-Phases 1-8 of the original brief are built. 473 tests pass.
+Phases 1-8 of the original brief are built. 476 tests pass.
 
 **The model has no demonstrated edge, and the costs are now bounded.**
 Measured on 3 markets after the sizing and label changes: out-of-sample

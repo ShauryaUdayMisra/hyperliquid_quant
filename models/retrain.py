@@ -156,6 +156,22 @@ def decide_promotion(
     if incumbent is None:
         return True, "no incumbent to compare against"
 
+    # An AUC is only comparable against another AUC on the same question.
+    # When the label changes, the incumbent scores well on a question nobody
+    # is asking any more, and comparing the two rejected the new model for
+    # being worse at something it was never trained to do -- which pinned the
+    # deployed model to the old label permanently, since every future
+    # candidate would lose the same comparison. Worse, it rejected one side
+    # of the book and promoted the other, leaving longs and shorts answering
+    # different questions.
+    if incumbent.label_config != candidate.label_config:
+        return True, (
+            f"the question changed from {incumbent.label_config.name} to "
+            f"{candidate.label_config.name}; the incumbent's AUC "
+            f"{incumbent.mean_val_auc:.4f} scores a different question and is "
+            "not a comparator"
+        )
+
     incumbent_auc = incumbent.mean_val_auc
     if not np.isfinite(incumbent_auc):
         return True, "incumbent has no usable validation AUC to defend itself with"
