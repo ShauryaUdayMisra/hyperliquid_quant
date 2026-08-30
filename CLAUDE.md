@@ -55,6 +55,32 @@ same close.
 `MarketView` and calls the same `ModelStrategy.on_bar`. Do not fork this
 logic — divergence would make the backtest stop being evidence about live.
 
+**A position is sized against the market, not against the account.**
+`ExecutionConfig.max_notional_for_impact` inverts the simulator's own
+`impact = k * sqrt(participation)` and the risk engine binds every order to
+it, so the rule that sizes a position and the model that charges it for the
+fill cannot disagree. A flat dollar cap is a different trade in every
+market: $10,000 is 0.01% of BTC's hourly volume and 5.6% of WLD's, which is
+9bp of impact against 237bp. Live, this was the entire loss — 1.67% average
+slippage per fill against a label asking for a 0.30% move, gross direction
+P&L of +$3,232 wiped out by $15,881 of execution. Liquidity comes from
+`MarketView.liquidity_notional`, a median over bars already seen; sizing off
+volume that has not arrived would put the largest positions on exactly the
+busiest bars.
+
+**A label has to clear what it costs to trade it.** `LabelSettings`
+(`LABEL_HORIZON_BARS`, `LABEL_THRESHOLD`) is configuration, and
+`ExecutionConfig.round_trip_cost()` is the floor it must clear: two taker
+fees, two half-spreads and two lots of impact at the sizing budget. The old
+default asked for a 0.30% move and cost 0.30% to trade, so being right
+earned nothing. At 24 bars and 1.00%, costs take 30% of the move instead of
+100%. `main.py train` refuses to be quiet about a label that does not clear
+its own cost, and — unlike everything else about a retrain — a *changed*
+label is adopted rather than inherited, loudly, because otherwise the
+setting is silently ignored forever and the live system keeps answering the
+old question. A model still answering the old one retrains on the first
+cycle rather than waiting for the schedule.
+
 **It trades both sides, on two separate models.** `model.pkl` asks
 P(rise > +0.30%); `model_down.pkl` asks P(fall > 0.30%). They are not
 complements: between them sits "goes nowhere", which is most bars, so a low
@@ -150,7 +176,7 @@ plants a deliberate leak to prove the checker works.
 ## Commands
 
 ```bash
-.venv/bin/python -m pytest              # 460 tests (+4 live, run with -m live)
+.venv/bin/python -m pytest              # 467 tests (+4 live, run with -m live)
 .venv/bin/python main.py status         # API reachability + safety checks
 .venv/bin/python main.py prove-accounting
 .venv/bin/python main.py backfill --days 400 --intervals 1h
@@ -304,8 +330,11 @@ trade rather than sit flat. Railway variables now:
 | `MARKETS` | `top:25` | The 25 most traded perps, resolved at startup. `all` (~176) is supported; see DEPLOY.md for the cost. |
 | `MAX_OPEN_POSITIONS` | `20` | Held at once. A forced entry fills every free slot, not just one. |
 | `MAX_POSITION_USD` | `10000` | Per position. 20 x $10k = $200k gross on $100k equity, i.e. 2x used of the 10x allowed. |
-| `MIN_HOLD_HOURS` | `4` | A fading probability may not close a position younger than this. Risk exits ignore it. |
+| `MIN_HOLD_HOURS` | `12` | A fading probability may not close a position younger than this. Risk exits ignore it. |
 | `SHORT_THRESHOLD` | = `SIGNAL_THRESHOLD` | P(down) needed to open a short. Shorting requires `model_down.pkl` beside `model.pkl`. |
+| `MAX_IMPACT_BPS` | `10` | Most expected impact a single order may pay. This, not `MAX_POSITION_USD`, is what actually sizes positions in all but the deepest markets. |
+| `LABEL_HORIZON_BARS` / `LABEL_THRESHOLD` | `24` / `0.01` | The question. Must clear `round_trip_cost()`. |
+| `MAX_IDLE_HOURS` | `0` | Forced entries **off**. They were the worst trades in the book: 181 forced round trips at −$54 each against +$24 for signal-driven ones. |
 
 He was shown the measured consequences and chose this anyway. **Do not
 quietly re-tighten these.** If the account collapses or liquidates, that is
@@ -324,10 +353,18 @@ The two things that were *not* removed, and should not be:
 
 ## Current status
 
-Phases 1-8 of the original brief are built. 460 tests pass.
+Phases 1-8 of the original brief are built. 467 tests pass.
 
-**The model has no demonstrated edge.** On 208 days of real BTC/ETH/SOL
-hourly data:
+**The model has no demonstrated edge, and the costs are now bounded.**
+Measured on 3 markets after the sizing and label changes: out-of-sample
+**−2.91%** against its own shuffled control at **−2.96%**. Those are the
+same number. The full-period +8.43% is ~85% in-sample and means nothing.
+What changed is the bleed, not the edge: out-of-sample went from −15.27% to
+−2.91% and slippage from 167bp of notional to 10bp. It now loses slowly to
+costs instead of quickly. Getting past that needs a better signal, not
+better plumbing.
+
+On 208 days of real BTC/ETH/SOL hourly data, before those changes:
 
 | | |
 | --- | --- |

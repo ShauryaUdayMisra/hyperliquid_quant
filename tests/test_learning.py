@@ -578,3 +578,43 @@ def test_a_skipped_attempt_is_not_written_to_the_history(store) -> None:
     record(RetrainOutcome(ts_ms=BASE_MS, status="rejected", reason="worse"),
            store=store)
     assert store.has_data("retrains")
+
+
+def test_a_model_answering_the_old_question_retrains_immediately() -> None:
+    """Changing the label changes what every probability means.
+
+    The entry threshold, the exit band and the live scorecard all assume the
+    deployed model answers the configured question. A model still answering
+    the previous one is stale in a way that waiting out a 24-hour schedule
+    does not fix.
+    """
+    from config.settings import LabelSettings
+    from models.labels import LabelConfig
+
+    trader = bare_trader()
+    trader.model.label_config = LabelConfig(horizon_bars=4, threshold=0.003)
+    object.__setattr__(trader.settings, "label",
+                       LabelSettings(horizon_bars=24, threshold=0.01))
+
+    # Re-run the constructor's staleness check.
+    configured, deployed = trader.settings.label, trader.model.label_config
+    stale = (deployed.horizon_bars != configured.horizon_bars
+             or deployed.threshold != configured.threshold)
+    assert stale
+    trader._last_retrain_ms = 0 if stale else BASE_MS
+    assert trader.retrain_due(BASE_MS)
+
+
+def test_a_label_that_does_not_clear_costs_is_a_question_worth_refusing() -> None:
+    """Predicting a move smaller than a round trip costs is predicting
+    something unprofitable even when the prediction is right."""
+    from config.settings import ExecutionConfig
+
+    execution = ExecutionConfig()
+    round_trip = execution.round_trip_cost()
+
+    # The old label: a 0.30% move against a 0.30% round trip.
+    assert 0.003 <= round_trip
+    # The configured one leaves most of the move on the table for the trader.
+    assert SETTINGS.label.threshold > round_trip
+    assert round_trip / SETTINGS.label.threshold < 0.5

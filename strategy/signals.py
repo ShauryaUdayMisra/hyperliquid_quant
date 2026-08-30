@@ -384,6 +384,9 @@ class ModelStrategy(BaseStrategy):
             confidence=signal.confidence,
             atr_fraction=candidate.atr_fraction,
             is_new_position=abs(current_size) <= 1e-12,
+            # Point-in-time: the median of the bars already seen, never the
+            # volume that is about to arrive.
+            bar_notional=view.liquidity_notional(coin),
         )
 
         # A short is justified by the down-model, so quote that one. Reporting

@@ -142,6 +142,15 @@ The live loop reuses the *same* `ModelStrategy` and `MarketView` as the
 backtest. Separate code paths would drift, and the backtest would stop being
 evidence about the live system.
 
+Positions are sized against each market's own traded volume, not by a flat
+dollar cap. The same $10,000 is 0.01% of BTC's hourly volume and 5.6% of a
+small-cap's — 9 basis points of expected impact against 237 — so a flat cap
+means the identical order is nearly free in one market and costs eight times
+the predicted move in another. The risk engine binds every order to an
+impact budget, using the same formula the fill simulator charges. The label
+must clear that cost too: predicting a 0.30% move that costs 0.30% to trade
+is predicting something unprofitable even when it is right.
+
 It trades both sides. Two models are trained: one asking P(rise > +0.30%),
 one asking P(fall > 0.30%). They are separate questions rather than
 complements — between them sits "goes nowhere", which is most bars — so a low
@@ -169,7 +178,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 .venv/bin/python main.py status            # API reachability + safety checks
 .venv/bin/python main.py prove-accounting  # verify the arithmetic
-.venv/bin/python -m pytest                 # 460 tests
+.venv/bin/python -m pytest                 # 467 tests
 
 .venv/bin/python main.py backfill --days 400 --intervals 1h
 .venv/bin/python main.py verify            # gaps + future timestamps

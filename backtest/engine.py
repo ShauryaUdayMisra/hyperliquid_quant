@@ -90,6 +90,23 @@ class MarketView:
         start = 0 if lookback is None else max(0, end - lookback)
         return frame.iloc[start:end]
 
+    def liquidity_notional(self, coin: str, lookback: int = 24) -> float:
+        """Typical notional traded per bar in this market, recently.
+
+        The median rather than the mean, so a single volume spike cannot
+        license an oversized position. Read through :meth:`history`, so it
+        is clipped at the current bar like everything else here -- sizing
+        today off tomorrow's volume would be look-ahead of the most
+        flattering kind.
+        """
+        frame = self.history(coin, lookback=lookback)
+        if frame.empty or "volume" not in frame.columns:
+            return 0.0
+        notional = (frame["volume"] * frame["close"]).replace(
+            [np.inf, -np.inf], np.nan
+        ).dropna()
+        return float(notional.median()) if len(notional) else 0.0
+
     def features(self, coin: str) -> pd.Series | None:
         """Point-in-time feature row for the current bar, if a pipeline ran."""
         frame = self._features.get(coin)

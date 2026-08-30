@@ -329,6 +329,23 @@ class ExecutionConfig:
     #: Anything beyond it becomes a partial fill.
     max_bar_volume_share: float = _env_float("MAX_BAR_VOLUME_SHARE", 0.10)
 
+    #: The most market impact a single order is allowed to expect to pay, in
+    #: basis points. This is a *sizing* budget, not a fill constraint: it
+    #: decides how large a position may be in a given market, where
+    #: max_bar_volume_share only decides how much of it can fill at once.
+    #:
+    #: It exists because a fixed dollar cap is a different trade in every
+    #: market. $10,000 is 0.01% of BTC's hourly volume and 5.6% of WLD's,
+    #: which under square-root impact is 9bp of cost against 237bp -- the
+    #: same order that is nearly free on BTC costs eight times the entire
+    #: move the model is trying to predict. Live, this was the whole loss:
+    #: 1.67% average slippage per fill against a 0.30% target.
+    #: 10bp each way puts a round trip at 30bp against a 1.00% label -- the
+    #: cost takes about a third of the move being predicted. Tighter than
+    #: that and only BTC can hold a meaningful position; looser and the
+    #: costs eat the thesis.
+    max_impact_bps: float = _env_float("MAX_IMPACT_BPS", 10.0)
+
     #: Maintenance-margin fraction fallback when an asset's max leverage is
     #: unknown. Hyperliquid uses half the initial margin at max leverage,
     #: i.e. 1 / (2 * max_leverage).
@@ -336,6 +353,32 @@ class ExecutionConfig:
 
     #: Extra cost charged when a position is force-closed by liquidation.
     liquidation_penalty: float = _env_float("LIQUIDATION_PENALTY", 0.01)
+
+    def max_notional_for_impact(self, bar_notional: float) -> float:
+        """Largest order whose expected impact stays inside the budget.
+
+        Inverts the simulator's ``impact = k * sqrt(participation)``, so the
+        rule that sizes a position and the model that charges it for the
+        fill can never disagree.
+        """
+        if bar_notional <= 0 or self.impact_coefficient <= 0:
+            return 0.0
+        if self.max_impact_bps <= 0:
+            return float("inf")
+        participation = (self.max_impact_bps / 10_000.0 / self.impact_coefficient) ** 2
+        return float(bar_notional * min(1.0, participation))
+
+    def round_trip_cost(self) -> float:
+        """What getting into a position and back out is expected to cost.
+
+        Two taker fees, two half-spreads and two lots of impact at the
+        sizing budget. This is the number a label's threshold has to clear
+        before the question is worth asking at all: predicting a move
+        smaller than this is predicting something unprofitable even when
+        the prediction is right.
+        """
+        impact = self.max_impact_bps / 10_000.0
+        return 2.0 * (self.taker_fee + self.default_half_spread + impact)
 
     def maintenance_margin_fraction(self, max_asset_leverage: float | None = None) -> float:
         leverage = max_asset_leverage or self.default_max_asset_leverage
@@ -410,6 +453,26 @@ class StrategyConfig:
 
 
 @dataclass(frozen=True)
+class LabelSettings:
+    """The question the models are asked.
+
+    Configurable because it is the main lever on whether the system can pay
+    for itself. The default horizon used to be 4 bars at 0.30%, which asked
+    the model to predict a move smaller than a round trip costs to trade in
+    most markets -- so being right earned less than being in. A longer
+    horizon lets the threshold clear costs without demanding the model
+    become more accurate.
+    """
+
+    horizon_bars: int = _env_int("LABEL_HORIZON_BARS", 24)
+    threshold: float = _env_float("LABEL_THRESHOLD", 0.010)
+
+    def describe(self) -> str:
+        return (f"{self.horizon_bars}-bar horizon, "
+                f"{self.threshold:.2%} move")
+
+
+@dataclass(frozen=True)
 class LearningConfig:
     """How the deployed model is kept current with what has happened since.
 
@@ -468,6 +531,7 @@ class Settings:
     risk: RiskLimits = field(default_factory=resolve_risk_profile)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
+    label: LabelSettings = field(default_factory=LabelSettings)
     learning: LearningConfig = field(default_factory=LearningConfig)
     report: ReportConfig = field(default_factory=ReportConfig)
 

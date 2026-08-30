@@ -36,6 +36,20 @@ def system():
     return universe, matrices, generator
 
 
+@pytest.fixture(scope="module")
+def deep_system():
+    """The same system on markets deep enough to absorb a real position."""
+    universe = synthetic_universe(2500, volume_scale=2_000_000.0)
+    matrices = build_universe(universe)
+    dataset = assemble(matrices, LabelConfig())
+    model, _ = train_walk_forward(
+        dataset, split_config=SplitConfig(n_folds=3), params=ModelParams(n_estimators=80)
+    )
+    generator = SignalGenerator(model, long_threshold=0.50)
+    generator.calibrate_feature_scales(usable_rows(dataset))
+    return universe, matrices, generator
+
+
 def run_backtest(system, profile: str, *, long_threshold: float = 0.50):
     universe, matrices, generator = system
     generator.long_threshold = long_threshold
@@ -127,9 +141,15 @@ def test_no_single_position_exceeds_the_notional_cap(system) -> None:
         assert notional.max() <= limits.max_position_usd * 1.6
 
 
-def test_the_aggressive_profile_takes_larger_positions(system) -> None:
-    conservative, _, _ = run_backtest(system, "conservative")
-    aggressive, _, _ = run_backtest(system, "aggressive")
+def test_the_aggressive_profile_takes_larger_positions(deep_system) -> None:
+    """On a market deep enough that liquidity is not the binding limit.
+
+    In a thin market the two profiles now size identically, because the
+    impact budget binds long before either notional cap does -- which is the
+    whole point of that budget, and is asserted separately below.
+    """
+    conservative, _, _ = run_backtest(deep_system, "conservative")
+    aggressive, _, _ = run_backtest(deep_system, "aggressive")
     conservative_peak = conservative.equity_curve["gross_notional"].max()
     aggressive_peak = aggressive.equity_curve["gross_notional"].max()
     assert aggressive_peak > conservative_peak

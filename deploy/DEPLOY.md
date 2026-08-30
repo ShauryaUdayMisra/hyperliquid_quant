@@ -270,6 +270,9 @@ your account to $100k and throws away the track record.
 | `TRADE_INTERVAL` | `1h` | Decision cadence. |
 | `BACKFILL_DAYS` | `400` | Hyperliquid serves ~5,000 candles, so 1h data caps near 208 days regardless. |
 | `SIGNAL_THRESHOLD` | `0.55` | P(up) a market must clear to open a long. |
+| `MAX_IMPACT_BPS` | `10` | The most expected market impact one order may pay. Positions are sized to this against each market's own traded volume, so the same setting means $11k on BTC and $18 on WLD. This is the binding size limit in all but the deepest markets — `MAX_POSITION_USD` is only a ceiling above it. |
+| `LABEL_HORIZON_BARS` | `24` | How far ahead the models predict. |
+| `LABEL_THRESHOLD` | `0.01` | The move they predict. Must exceed a round trip's cost, or being right still loses money. Changing either retrains the deployed models on the next cycle. |
 | `SHORT_THRESHOLD` | same as `SIGNAL_THRESHOLD` | P(down) a market must clear to open a short. Passed as `--short-threshold`; shorting needs `model_down.pkl` beside `model.pkl`. |
 | `RISK_PROFILE` | `conservative` | `aggressive` removes the daily-loss and drawdown halts and raises leverage to 10x. Liquidation still applies and is the only backstop left. |
 | `MAX_HOLD_HOURS` | `24` | Force-close a position past this age. Re-entry allowed. 0 disables. |

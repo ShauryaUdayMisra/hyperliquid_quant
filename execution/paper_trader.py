@@ -178,6 +178,21 @@ class PaperTrader:
         )
         self.last_retrain: RetrainOutcome | None = None
 
+        # A model answering a different question from the configured one is
+        # stale in a way no schedule should have to wait out: every
+        # probability it produces means something other than what the entry
+        # threshold assumes. Due immediately rather than at the next slot.
+        configured = self.settings.label
+        deployed = self.model.label_config
+        if (deployed.horizon_bars != configured.horizon_bars
+                or deployed.threshold != configured.threshold):
+            log.warning(
+                "deployed model asks %s but the configuration asks for a %s; "
+                "retraining on the first cycle rather than waiting for the "
+                "schedule", deployed.name, configured.describe(),
+            )
+            self._last_retrain_ms = 0
+
         # The idle clock is restored, not restarted. Counting flat bars in
         # memory meant every redeploy handed the timer a fresh zero, so on a
         # service that redeploys more often than the limit it could never

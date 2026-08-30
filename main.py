@@ -270,6 +270,17 @@ def cmd_train(args: argparse.Namespace) -> int:
     base = Path(args.output or SETTINGS.paths.models / "model.pkl")
     directions = ["up", "down"] if args.direction == "both" else [args.direction]
 
+    # A label whose threshold sits under the cost of trading it asks the
+    # model to predict something unprofitable even when it is right.
+    round_trip = SETTINGS.execution.round_trip_cost()
+    if args.threshold <= round_trip:
+        print(f"\n!! WARNING: a {args.threshold:.2%} move does not clear the "
+              f"{round_trip:.2%} it costs to trade a round trip. Being right "
+              f"would still lose money. Raise LABEL_THRESHOLD or the horizon.\n")
+    else:
+        print(f"Costs take {round_trip / args.threshold:.0%} of a "
+              f"{args.threshold:.2%} move ({round_trip:.2%} round trip).")
+
     for direction in directions:
         label_config = LabelConfig(
             horizon_bars=args.horizon, threshold=args.threshold, direction=direction,
@@ -561,8 +572,10 @@ def build_parser() -> argparse.ArgumentParser:
     train = sub.add_parser("train", help="train the signal model with walk-forward validation")
     train.add_argument("--coins", nargs="*", default=None)
     train.add_argument("--interval", default="1h")
-    train.add_argument("--horizon", type=int, default=4, help="label horizon in bars")
-    train.add_argument("--threshold", type=float, default=0.003, help="label return threshold")
+    train.add_argument("--horizon", type=int, default=SETTINGS.label.horizon_bars,
+                       help="label horizon in bars (LABEL_HORIZON_BARS)")
+    train.add_argument("--threshold", type=float, default=SETTINGS.label.threshold,
+                       help="label return threshold (LABEL_THRESHOLD)")
     train.add_argument("--folds", type=int, default=5)
     train.add_argument("--test-fraction", type=float, default=0.2)
     train.add_argument("--skip-holdout", action="store_true",

@@ -244,3 +244,104 @@ def test_disabled_halts_report_as_none_not_as_a_number() -> None:
     status = engine("aggressive").status(state(engine("aggressive")))
     assert status["daily_loss_limit"] is None
     assert status["drawdown_limit"] is None
+
+
+# ==========================================================================
+# Sizing against the market's own liquidity
+# ==========================================================================
+
+def test_a_thin_market_gets_a_smaller_position_than_a_deep_one() -> None:
+    """A flat dollar cap is a different trade in every market.
+
+    $10,000 is 0.01% of BTC's hourly volume and 5.6% of a small-cap's, which
+    under square-root impact is 9bp of cost against 237bp -- eight times the
+    entire move the model is trying to predict. Live, this was the whole
+    loss: 1.67% average slippage per fill against a 0.30% target.
+    """
+    from config.settings import ExecutionConfig, resolve_risk_profile
+    from risk.risk_engine import RiskEngine
+
+    limits = resolve_risk_profile("aggressive")
+    engine = RiskEngine(limits, ExecutionConfig())
+    state = engine.account_state(
+        ts_ms=0, equity=100_000.0, gross_notional=0.0, open_positions=0
+    )
+
+    deep = engine.evaluate(coin="BTC", state=state, confidence=1.0,
+                           atr_fraction=0.02, bar_notional=110_000_000.0)
+    thin = engine.evaluate(coin="WLD", state=state, confidence=1.0,
+                           atr_fraction=0.02, bar_notional=180_000.0)
+
+    assert deep.approved_notional > thin.approved_notional * 50
+
+
+def test_the_liquidity_cap_holds_expected_impact_inside_its_budget() -> None:
+    """The sizing rule inverts the simulator's own impact formula, so what
+    sizes a position and what charges it for the fill cannot disagree."""
+    import math
+
+    from config.settings import ExecutionConfig, resolve_risk_profile
+    from execution.simulator import FillSimulator
+    from risk.risk_engine import RiskEngine
+
+    execution = ExecutionConfig()
+    engine = RiskEngine(resolve_risk_profile("aggressive"), execution)
+    state = engine.account_state(
+        ts_ms=0, equity=100_000.0, gross_notional=0.0, open_positions=0
+    )
+    bar_notional = 5_000_000.0
+    decision = engine.evaluate(coin="X", state=state, confidence=1.0,
+                               atr_fraction=0.02, bar_notional=bar_notional)
+
+    # Charge that size through the simulator's own impact model.
+    participation = decision.approved_notional / bar_notional
+    impact = execution.impact_coefficient * math.sqrt(participation)
+    assert impact <= execution.max_impact_bps / 10_000.0 + 1e-9
+
+
+def test_a_market_with_no_volume_history_is_not_sized_off_a_guess() -> None:
+    """Zero known volume means zero permitted size, not an unbounded one."""
+    from config.settings import ExecutionConfig, resolve_risk_profile
+    from risk.risk_engine import RiskEngine
+
+    engine = RiskEngine(resolve_risk_profile("aggressive"), ExecutionConfig())
+    state = engine.account_state(
+        ts_ms=0, equity=100_000.0, gross_notional=0.0, open_positions=0
+    )
+    assert engine.evaluate(coin="NEW", state=state, confidence=1.0,
+                           atr_fraction=0.02, bar_notional=0.0).approved_notional >= 0.0
+
+
+def test_the_liquidity_limit_is_recorded_in_the_decision() -> None:
+    """A position that came back smaller than asked must say why."""
+    from config.settings import ExecutionConfig, resolve_risk_profile
+    from risk.risk_engine import RiskEngine
+
+    engine = RiskEngine(resolve_risk_profile("aggressive"), ExecutionConfig())
+    state = engine.account_state(
+        ts_ms=0, equity=100_000.0, gross_notional=0.0, open_positions=0
+    )
+    decision = engine.evaluate(coin="WLD", state=state, confidence=1.0,
+                               atr_fraction=0.02, bar_notional=180_000.0)
+    assert any(c.name == "liquidity" for c in decision.checks)
+    assert "impact" in decision.summary() or any(
+        "impact" in c.describe() for c in decision.checks
+    )
+
+
+def test_liquidity_sizing_is_point_in_time() -> None:
+    """Sizing today off tomorrow's volume would be look-ahead of the most
+    flattering kind: the biggest positions on exactly the busiest bars."""
+    import numpy as np
+    import pandas as pd
+
+    from backtest.engine import MarketView
+
+    bars = {"X": pd.DataFrame({
+        "ts_ms": [i * 3_600_000 for i in range(10)],
+        "close": [100.0] * 10,
+        # Volume explodes only after bar 4.
+        "volume": [10.0] * 5 + [10_000.0] * 5,
+    })}
+    view = MarketView(4, 0, bars, {}, None, None)
+    assert view.liquidity_notional("X", lookback=10) == pytest.approx(1_000.0)

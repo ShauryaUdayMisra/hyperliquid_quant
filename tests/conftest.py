@@ -218,6 +218,7 @@ def synthetic_bars(
     drift: float = 0.0002,
     vol: float = 0.01,
     funding_rate: float | None = 0.00005,
+    volume_scale: float = 100.0,
 ):
     """A deterministic random walk with volatility clustering and OHLC.
 
@@ -243,7 +244,11 @@ def synthetic_bars(
     wiggle = np.abs(rng.standard_normal(n)) * sigma * close
     high = np.maximum(open_, close) + wiggle
     low = np.minimum(open_, close) - wiggle
-    volume = np.abs(rng.lognormal(mean=3.0, sigma=0.6, size=n)) * 100
+    # ``volume_scale`` exists because positions are now sized against the
+    # market's traded notional. The default is a thin market on purpose --
+    # that is the realistic case and the one that bites -- so a test about
+    # something else must ask for a deep one explicitly.
+    volume = np.abs(rng.lognormal(mean=3.0, sigma=0.6, size=n)) * volume_scale
 
     frame = pd.DataFrame(
         {

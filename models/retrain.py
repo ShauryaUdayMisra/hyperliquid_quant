@@ -381,7 +381,29 @@ def retrain(
         # rebuilding it per side would double the expensive half of the work.
         if matrices is None:
             matrices = build_features(coins, interval, store=store)
-        label_config = incumbent.label_config if incumbent else LabelConfig()
+        # Normally the question is inherited, so retraining changes only what
+        # the model has seen. But the label is configuration, and a change to
+        # it is a deliberate act that has to reach the deployed model --
+        # otherwise the setting is silently ignored forever and the live
+        # system keeps answering the old question. Adopted loudly, never
+        # quietly.
+        configured = LabelConfig(
+            horizon_bars=settings.label.horizon_bars,
+            threshold=settings.label.threshold,
+            direction=side if side in {"up", "down"} else "up",
+        )
+        label_config = incumbent.label_config if incumbent else configured
+        if incumbent is not None and (
+            label_config.horizon_bars != configured.horizon_bars
+            or label_config.threshold != configured.threshold
+        ):
+            log.warning(
+                "the configured label (%s) differs from the deployed model's "
+                "(%s); adopting the configured one. Every probability this "
+                "model produces from now on answers a different question.",
+                configured.name, label_config.name,
+            )
+            label_config = configured
         params = incumbent.params if incumbent else ModelParams()
         # Keep the backend stable across a retrain unless it is unavailable.
         # Silently swapping LightGBM for scikit-learn would change the live

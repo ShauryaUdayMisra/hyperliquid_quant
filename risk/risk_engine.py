@@ -219,6 +219,7 @@ class RiskEngine:
         atr_fraction: float | None,
         is_new_position: bool = True,
         max_asset_leverage: float | None = None,
+        bar_notional: float | None = None,
     ) -> RiskDecision:
         """Size a proposed trade and apply every limit. The answer is final."""
         checks: list[RiskCheck] = []
@@ -275,8 +276,28 @@ class RiskEngine:
         approved = requested
         binding: str | None = None
 
+        # What this particular market can absorb without the cost of getting
+        # in and out swamping the move being predicted. A flat dollar cap is
+        # a different trade in every market: the same $10,000 is 0.01% of
+        # BTC's hourly volume and 5.6% of a small-cap's, which is 9bp of
+        # impact against 237bp. Sized here rather than in the strategy so
+        # that, as with every other limit, the risk engine has the final say
+        # and the reason is recorded in the decision.
+        if bar_notional is not None and bar_notional > 0:
+            liquidity_cap = self.execution.max_notional_for_impact(bar_notional)
+            if approved > liquidity_cap:
+                approved = liquidity_cap
+                binding = "liquidity"
+            checks.append(RiskCheck(
+                "liquidity", True,
+                f"${liquidity_cap:,.0f} keeps expected impact within "
+                f"{self.execution.max_impact_bps:.0f}bp at "
+                f"${bar_notional:,.0f}/bar of volume",
+                liquidity_cap, requested,
+            ))
+
         if approved > self.limits.max_position_usd:
-            approved = self.limits.max_position_usd
+            approved = min(approved, self.limits.max_position_usd)
             binding = "max_position_usd"
         checks.append(RiskCheck(
             "max_position_usd", True,
