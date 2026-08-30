@@ -54,8 +54,14 @@ def test_the_exchanges_own_casing_is_preserved() -> None:
     Upper-casing the name produced a market that every later API call failed
     to find: it could never be refreshed, never had bars, and took the whole
     trading cycle down with it.
+
+    Those two are memecoins and are gated out by default now, so the filter
+    is turned off here -- this is a test about casing, and letting a second
+    rule decide the outcome would stop it testing the first.
     """
-    ranked = rank_by_volume(meta("kPEPE", "BTC", "kBONK"), ctxs(9, 8, 7))
+    ranked = rank_by_volume(
+        meta("kPEPE", "BTC", "kBONK"), ctxs(9, 8, 7), exclude_memecoins=False
+    )
     assert ranked == ["kPEPE", "BTC", "kBONK"]
 
 
@@ -102,3 +108,76 @@ def test_an_unreachable_exchange_degrades_instead_of_aborting() -> None:
 def test_a_literal_spec_needs_no_network_at_all() -> None:
     client = _Client(error=AssertionError("must not be called"))
     assert resolve("BTC,ETH", client) == ("BTC", "ETH")
+
+
+# ==========================================================================
+# Memecoins
+# ==========================================================================
+
+def test_the_thousand_unit_prefix_does_not_hide_a_memecoin() -> None:
+    """Hyperliquid lists 1,000 PEPE as "kPEPE". An entry for PEPE has to
+    catch it, or the deny-list silently misses the form actually traded."""
+    from data.universe import is_memecoin
+
+    assert is_memecoin("kPEPE")
+    assert is_memecoin("kBONK")
+    assert is_memecoin("kSHIB")
+
+
+def test_a_name_that_merely_starts_with_k_is_not_a_prefixed_form() -> None:
+    """The prefix is a lowercase k in front of an upper-case name. Stripping
+    it from KAITO would leave AITO and invite a false match."""
+    from data.universe import is_memecoin
+
+    assert not is_memecoin("KAITO")
+    assert not is_memecoin("KAS")
+    assert not is_memecoin("kLUNC")
+
+
+def test_volatility_is_not_the_criterion() -> None:
+    """Gaming and NFT tokens are volatile but are not jokes; position sizing
+    already handles volatility, so it is not what this list is for."""
+    from data.universe import is_memecoin
+
+    for coin in ("SAND", "GALA", "AXS", "APE", "YGG", "ZORA", "BTC", "SOL"):
+        assert not is_memecoin(coin), coin
+
+
+def test_memecoins_are_dropped_from_a_ranked_universe() -> None:
+    from data.universe import rank_by_volume
+
+    meta = {"universe": [{"name": n} for n in ("BTC", "DOGE", "ETH", "kPEPE", "SOL")]}
+    contexts = [{"dayNtlVlm": v} for v in (900, 800, 700, 600, 500)]
+
+    assert rank_by_volume(meta, contexts, exclude_memecoins=True) == ["BTC", "ETH", "SOL"]
+    assert "DOGE" in rank_by_volume(meta, contexts, exclude_memecoins=False)
+
+
+def test_naming_a_memecoin_explicitly_is_not_a_way_around_the_rule(monkeypatch) -> None:
+    """"Do not trade memecoins" is a property of the system, not of one way
+    of spelling the universe."""
+    import importlib
+
+    monkeypatch.setenv("EXCLUDE_MEMECOINS", "true")
+    import config.settings as settings_module
+    importlib.reload(settings_module)
+    import data.universe as universe_module
+    importlib.reload(universe_module)
+
+    assert universe_module.resolve("BTC,DOGE,ETH", client=None) == ("BTC", "ETH")
+
+
+def test_the_exclusion_can_be_turned_off_deliberately(monkeypatch) -> None:
+    import importlib
+
+    monkeypatch.setenv("EXCLUDE_MEMECOINS", "false")
+    import config.settings as settings_module
+    importlib.reload(settings_module)
+    import data.universe as universe_module
+    importlib.reload(universe_module)
+
+    assert "DOGE" in universe_module.resolve("BTC,DOGE", client=None)
+
+    monkeypatch.delenv("EXCLUDE_MEMECOINS")
+    importlib.reload(settings_module)
+    importlib.reload(universe_module)

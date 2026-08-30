@@ -55,6 +55,25 @@ same close.
 `MarketView` and calls the same `ModelStrategy.on_bar`. Do not fork this
 logic — divergence would make the backtest stop being evidence about live.
 
+**Memecoins are not traded.** `data.universe.MEMECOINS` is a hand-maintained
+deny-list — there is no exchange field that identifies one — applied to
+ranked *and* explicit `MARKETS` forms alike, because "do not trade
+memecoins" is a property of the system and not of one way of spelling the
+universe. `is_memecoin` strips Hyperliquid's thousand-unit prefix, so an
+entry for PEPE catches `kPEPE`, but only when the prefix is a lowercase `k`
+in front of an otherwise upper-case name — otherwise `KAITO` would be read
+as a prefixed `AITO`. Every gated name is logged, because a wrong entry
+removes a market silently and a shrinking universe looks exactly like a
+quiet one.
+
+Do not justify this as a liquidity filter. Measured on the live top:25,
+dropping the six memecoins made the book *shallower*: median hourly volume
+−37%, deployable capital −3%, because the names promoted in their place rank
+lower by volume. Sizing already handles liquidity. This is a judgement that
+reported volume on a memecoin is worth less than the same number on LTC, and
+volatility is explicitly not the criterion — SAND, GALA, AXS, APE and ZORA
+are not on the list.
+
 **A position is sized against the market, not against the account.**
 `ExecutionConfig.max_notional_for_impact` inverts the simulator's own
 `impact = k * sqrt(participation)` and the risk engine binds every order to
@@ -176,7 +195,7 @@ plants a deliberate leak to prove the checker works.
 ## Commands
 
 ```bash
-.venv/bin/python -m pytest              # 467 tests (+4 live, run with -m live)
+.venv/bin/python -m pytest              # 473 tests (+4 live, run with -m live)
 .venv/bin/python main.py status         # API reachability + safety checks
 .venv/bin/python main.py prove-accounting
 .venv/bin/python main.py backfill --days 400 --intervals 1h
@@ -353,7 +372,7 @@ The two things that were *not* removed, and should not be:
 
 ## Current status
 
-Phases 1-8 of the original brief are built. 467 tests pass.
+Phases 1-8 of the original brief are built. 473 tests pass.
 
 **The model has no demonstrated edge, and the costs are now bounded.**
 Measured on 3 markets after the sizing and label changes: out-of-sample

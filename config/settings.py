@@ -159,6 +159,18 @@ class DataConfig:
     #: features.pipeline.MAX_LOOKBACK_BARS with room to spare. Uncapped, a
     #: large universe would load every stored bar for every coin on every
     #: cycle, which is where a 3-coin system stops scaling.
+    #: Memecoins are not traded. There is no exchange field that identifies
+    #: one, so data.universe.MEMECOINS is a hand-maintained list and the
+    #: resolver logs every name it drops.
+    exclude_memecoins: bool = _env_bool("EXCLUDE_MEMECOINS", True)
+
+    #: Further names to gate out, on top of the built-in lists.
+    excluded_markets: tuple[str, ...] = tuple(
+        m.strip().upper()
+        for m in _env("EXCLUDED_MARKETS", "").split(",")
+        if m.strip()
+    )
+
     live_lookback_bars: int = _env_int("LIVE_LOOKBACK_BARS", 1_000)
 
     #: Candle intervals to backfill and keep in sync.

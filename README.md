@@ -178,7 +178,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 .venv/bin/python main.py status            # API reachability + safety checks
 .venv/bin/python main.py prove-accounting  # verify the arithmetic
-.venv/bin/python -m pytest                 # 467 tests
+.venv/bin/python -m pytest                 # 473 tests
 
 .venv/bin/python main.py backfill --days 400 --intervals 1h
 .venv/bin/python main.py verify            # gaps + future timestamps

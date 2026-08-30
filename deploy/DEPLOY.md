@@ -270,6 +270,8 @@ your account to $100k and throws away the track record.
 | `TRADE_INTERVAL` | `1h` | Decision cadence. |
 | `BACKFILL_DAYS` | `400` | Hyperliquid serves ~5,000 candles, so 1h data caps near 208 days regardless. |
 | `SIGNAL_THRESHOLD` | `0.55` | P(up) a market must clear to open a long. |
+| `EXCLUDE_MEMECOINS` | `true` | Memecoins are never traded, in ranked and explicit `MARKETS` forms alike. The list is hand-maintained in `data/universe.py`; every gated name is logged at startup. Set `false` to allow them. |
+| `EXCLUDED_MARKETS` | *(empty)* | Extra comma-separated names to gate out, on top of the built-in lists. |
 | `MAX_IMPACT_BPS` | `10` | The most expected market impact one order may pay. Positions are sized to this against each market's own traded volume, so the same setting means $11k on BTC and $18 on WLD. This is the binding size limit in all but the deepest markets — `MAX_POSITION_USD` is only a ceiling above it. |
 | `LABEL_HORIZON_BARS` | `24` | How far ahead the models predict. |
 | `LABEL_THRESHOLD` | `0.01` | The move they predict. Must exceed a round trip's cost, or being right still loses money. Changing either retrains the deployed models on the next cycle. |
